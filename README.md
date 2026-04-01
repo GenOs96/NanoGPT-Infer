@@ -1,5 +1,5 @@
 # NanoGPT-Infer
-- A Minimal High-Performance GPT Inference Engine 
+- A Minimal High-Performance GPT Inference Engine.
 
 __Bare Bones components:__
 - Token + positional embeddings
