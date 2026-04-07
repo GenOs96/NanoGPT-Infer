@@ -43,21 +43,40 @@ class CausalSelfAttention(nn.Module):
             .view(1, 1, config.block_size, config.block_size),
         )
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None, layer_idx=None):
         B, T, C = x.shape
 
         qkv = self.qkv(x)
         q, k, v = qkv.split(C, dim=2)
 
+        # Always move q/k/v into (B, T, n_head, head_dim) first so both
+        # cached and non-cached paths share identical tensor layouts.
+        q = q.view(B, T, self.n_head, self.head_dim)
+        k = k.view(B, T, self.n_head, self.head_dim)
+        v = v.view(B, T, self.n_head, self.head_dim)
+
+        if kv_cache is not None:
+            k, v = kv_cache.update(layer_idx, k, v)
+
         # reshape
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         # attention
         att = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+        if kv_cache is None:
+            # training / no cache
+            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+        else:
+            # cache mode: source length can exceed query length
+            S = k.size(-2)
+            q_start = S - T
+            att = att.masked_fill(
+                self.mask[:, :, q_start:S, :S] == 0,
+                float("-inf"),
+            )
 
         att = F.softmax(att, dim=-1)
 
@@ -91,8 +110,8 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, kv_cache=None, layer_idx=None):
+        x = x + self.attn(self.ln1(x), kv_cache=kv_cache, layer_idx=layer_idx)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -116,15 +135,19 @@ class GPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx, kv_cache=None):
         B, T = idx.shape
 
-        positions = torch.arange(0, T, device=idx.device).unsqueeze(0)
+        if kv_cache is not None:
+            start_pos = kv_cache.current_seq_len
+            positions = torch.arange(start_pos, start_pos + T, device=idx.device).unsqueeze(0)
+        else:
+            positions = torch.arange(0, T, device=idx.device).unsqueeze(0)
 
         x = self.token_emb(idx) + self.pos_emb(positions)
 
         for i, block in enumerate(self.blocks):
-            x = block(x)
+            x = block(x, kv_cache=kv_cache, layer_idx=i)
 
         x = self.ln_f(x)
 
