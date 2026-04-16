@@ -1,8 +1,10 @@
 import argparse
+import csv
 import os
 import random
 import sys
 import time
+
 import matplotlib.pyplot as plt
 import torch
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
@@ -81,12 +83,12 @@ def print_metrics(
     print()
 
 
-def plot_metrics(
+def build_metric_rows(
     latency_no_cache: float,
     latency_cache: float,
     generated_tokens: int,
     max_context_len: int,
-) -> None:
+) -> list[dict[str, float | int | str]]:
     labels = ["Without KV cache", "With KV cache"]
     latencies = [latency_no_cache, latency_cache]
 
@@ -97,6 +99,51 @@ def plot_metrics(
         decode_ms = [0.0, 0.0]
         throughputs = [0.0, 0.0]
 
+    rows = []
+    for label, latency, decode_latency, throughput in zip(
+        labels,
+        latencies,
+        decode_ms,
+        throughputs,
+    ):
+        rows.append(
+            {
+                "mode": label,
+                "generated_tokens": generated_tokens,
+                "max_context_len": max_context_len,
+                "end_to_end_latency_s": latency,
+                "decode_latency_ms_per_token": decode_latency,
+                "throughput_tokens_per_sec": throughput,
+            }
+        )
+
+    return rows
+
+
+def save_metric_rows(rows: list[dict[str, float | int | str]]) -> str:
+    artifacts_dir = os.path.join(os.path.dirname(__file__), "artifacts")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    csv_path = os.path.join(artifacts_dir, "kv_cache_simple_test_metrics.csv")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return csv_path
+
+
+def save_metrics_plot(rows: list[dict[str, float | int | str]]) -> str:
+    artifacts_dir = os.path.join(os.path.dirname(__file__), "artifacts")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    png_path = os.path.join(artifacts_dir, "kv_cache_simple_test_metrics.png")
+
+    labels = [str(row["mode"]) for row in rows]
+    latencies = [float(row["end_to_end_latency_s"]) for row in rows]
+    decode_ms = [float(row["decode_latency_ms_per_token"]) for row in rows]
+    throughputs = [float(row["throughput_tokens_per_sec"]) for row in rows]
+    max_context_len = int(rows[0]["max_context_len"])
+
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     colors = ["#d95f02", "#1b9e77"]
     metrics = [
@@ -106,7 +153,7 @@ def plot_metrics(
     ]
 
     for ax, (values, title, ylabel) in zip(axes, metrics):
-        bars = ax.bar(labels, values, color=colors)
+        bars = ax.bar(labels, values, color=colors[: len(values)])
         ax.set_title(title)
         ax.set_ylabel(ylabel)
         ax.tick_params(axis="x", rotation=10)
@@ -121,7 +168,10 @@ def plot_metrics(
 
     fig.suptitle(f"KV Cache Performance Comparison (total context={max_context_len})")
     fig.tight_layout()
-    plt.show()
+    fig.savefig(png_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    return png_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -202,12 +252,16 @@ def main() -> None:
         generated_tokens,
         tokenizer,
     )
-    plot_metrics(
+    metric_rows = build_metric_rows(
         latency_no_cache=latency_no_cache,
         latency_cache=latency_cache,
         generated_tokens=generated_tokens,
         max_context_len=args.max_context_len,
     )
+    csv_path = save_metric_rows(metric_rows)
+    png_path = save_metrics_plot(metric_rows)
+    print(f"Saved comparison metrics to: {csv_path}")
+    print(f"Saved comparison plot to: {png_path}")
 
 
 if __name__ == "__main__":
