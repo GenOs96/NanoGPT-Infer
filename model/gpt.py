@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 
 # -----------------------------------------------------------
@@ -46,44 +47,53 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, kv_cache=None, layer_idx=None):
         B, T, C = x.shape
 
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(C, dim=2)
+        attn_scope = (
+            f"block_{layer_idx}.attention"
+            if layer_idx is not None
+            else "attention"
+        )
 
-        # Always move q/k/v into (B, T, n_head, head_dim) first so both
-        # cached and non-cached paths share identical tensor layouts.
-        q = q.view(B, T, self.n_head, self.head_dim)
-        k = k.view(B, T, self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, self.head_dim)
+        with record_function(attn_scope):
+            qkv = self.qkv(x)
+            q, k, v = qkv.split(C, dim=2)
 
-        if kv_cache is not None:
-            k, v = kv_cache.update(layer_idx, k, v)
+            # Always move q/k/v into (B, T, n_head, head_dim) first so both
+            # cached and non-cached paths share identical tensor layouts.
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = k.view(B, T, self.n_head, self.head_dim)
+            v = v.view(B, T, self.n_head, self.head_dim)
 
-        # reshape
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+            if kv_cache is not None:
+                with record_function("kv_cache"):
+                    k, v = kv_cache.update(layer_idx, k, v)
 
-        # attention
-        att = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
 
-        if kv_cache is None:
-            # training / no cache
-            att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        else:
-            # cache mode: source length can exceed query length
-            S = k.size(-2)
-            q_start = S - T
-            att = att.masked_fill(
-                self.mask[:, :, q_start:S, :S] == 0,
-                float("-inf"),
-            )
+            att = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
-        att = F.softmax(att, dim=-1)
+            if kv_cache is None:
+                # training / no cache
+                att = att.masked_fill(
+                    self.mask[:, :, :T, :T] == 0,
+                    float("-inf"),
+                )
+            else:
+                # cache mode: source length can exceed query length
+                S = k.size(-2)
+                q_start = S - T
+                att = att.masked_fill(
+                    self.mask[:, :, q_start:S, :S] == 0,
+                    float("-inf"),
+                )
 
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+            att = F.softmax(att, dim=-1)
 
-        return self.proj(y)
+            y = att @ v
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+            return self.proj(y)
 
 
 # -----------------------------------------------------------
@@ -95,8 +105,11 @@ class MLP(nn.Module):
         self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd)
 
-    def forward(self, x):
-        return self.fc2(F.gelu(self.fc1(x)))
+    def forward(self, x, layer_idx=None):
+        mlp_scope = f"block_{layer_idx}.mlp" if layer_idx is not None else "mlp"
+        with record_function(mlp_scope):
+            x = F.gelu(self.fc1(x))
+            return self.fc2(x)
 
 
 # -----------------------------------------------------------
@@ -111,9 +124,15 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, kv_cache=None, layer_idx=None):
-        x = x + self.attn(self.ln1(x), kv_cache=kv_cache, layer_idx=layer_idx)
-        x = x + self.mlp(self.ln2(x))
-        return x
+        block_scope = f"block_{layer_idx}" if layer_idx is not None else "block"
+        with record_function(block_scope):
+            x = x + self.attn(
+                self.ln1(x),
+                kv_cache=kv_cache,
+                layer_idx=layer_idx,
+            )
+            x = x + self.mlp(self.ln2(x), layer_idx=layer_idx)
+            return x
 
 
 # -----------------------------------------------------------
@@ -138,22 +157,27 @@ class GPT(nn.Module):
     def forward(self, idx, kv_cache=None):
         B, T = idx.shape
 
-        if kv_cache is not None:
-            start_pos = kv_cache.current_seq_len
-            positions = torch.arange(start_pos, start_pos + T, device=idx.device).unsqueeze(0)
-        else:
-            positions = torch.arange(0, T, device=idx.device).unsqueeze(0)
+        with record_function("gpt.forward"):
+            if kv_cache is not None:
+                start_pos = kv_cache.current_seq_len
+                positions = torch.arange(
+                    start_pos,
+                    start_pos + T,
+                    device=idx.device,
+                ).unsqueeze(0)
+            else:
+                positions = torch.arange(0, T, device=idx.device).unsqueeze(0)
 
-        x = self.token_emb(idx) + self.pos_emb(positions)
+            x = self.token_emb(idx) + self.pos_emb(positions)
 
-        for i, block in enumerate(self.blocks):
-            x = block(x, kv_cache=kv_cache, layer_idx=i)
+            for i, block in enumerate(self.blocks):
+                x = block(x, kv_cache=kv_cache, layer_idx=i)
 
-        x = self.ln_f(x)
+            x = self.ln_f(x)
 
-        logits = self.lm_head(x)
+            logits = self.lm_head(x)
 
-        return logits
+            return logits
 
 # -----------------------------------------------------------
 # Weight Loading (Hugging Face GPT-2)
