@@ -4,7 +4,7 @@ import os
 import random
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
@@ -232,11 +232,12 @@ def run_kv_cache_workload(
 
         with nvtx_range("decode", enable_nvtx):
             for step in range(max_new_tokens):
-                step_name = f"decode_step_{step}" if mark_decode_steps else "decode_step"
-                with nvtx_range(step_name, enable_nvtx):
-                    next_token = sample_logits(logits)
-                    tokens = torch.cat([tokens, next_token], dim=1)
-                    logits = model(next_token, kv_cache=kv_cache)
+                with nvtx_range("decode_step", enable_nvtx):
+                    step_name = f"decode_step_{step}" if mark_decode_steps else None
+                    with nvtx_range(step_name, enable_nvtx) if step_name else nullcontext():
+                        next_token = sample_logits(logits)
+                        tokens = torch.cat([tokens, next_token], dim=1)
+                        logits = model(next_token, kv_cache=kv_cache)
 
     return tokens
 
