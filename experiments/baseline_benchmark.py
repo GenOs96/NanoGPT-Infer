@@ -21,7 +21,7 @@ from model.gpt import GPT, GPTConfig, load_hf_weights
 
 DEFAULT_MODEL_NAME = "gpt2"
 DEFAULT_PROMPT = "Once upon a time"
-DEFAULT_TOTAL_LENGTHS = [64, 128, 256, 512, 768, 896, 1024]
+DEFAULT_TOTAL_LENGTHS = [32, 128, 512, 768, 1024]
 DEFAULT_SEED = 1234
 
 
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         "--total-lengths",
         type=parse_int_list,
         default=DEFAULT_TOTAL_LENGTHS,
-        help="Comma-separated total prompt + generated lengths, for example 64,128,256,512,1024.",
+        help="Comma-separated total prompt + generated lengths, for example 32,128,512,768,1024.",
     )
     parser.add_argument(
         "--warmup-runs",
@@ -76,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SEED,
         help="Base seed for reproducible sampling.",
+    )
+    parser.add_argument(
+        "--include-percentiles",
+        action="store_true",
+        help="Include p50 and p95 columns in the output CSV.",
     )
     return parser.parse_args()
 
@@ -175,6 +180,7 @@ def benchmark_total_length(
     measure_runs: int,
     device: str,
     seed: int,
+    include_percentiles: bool,
 ) -> dict[str, float | int | str]:
     prompt_length = input_ids.shape[1]
     generated_tokens = total_length - prompt_length
@@ -230,7 +236,7 @@ def benchmark_total_length(
     throughput_stats = summarize(throughput)
     memory_stats = summarize(peak_memories)
 
-    return {
+    row = {
         "mode": "baseline",
         "prompt_length": prompt_length,
         "new_tokens": generated_tokens,
@@ -239,18 +245,26 @@ def benchmark_total_length(
         "warmup_runs": warmup_runs,
         "measure_runs": measure_runs,
         "e2e_latency_s_mean": latency_stats["mean"],
-        "e2e_latency_s_p50": latency_stats["p50"],
-        "e2e_latency_s_p95": latency_stats["p95"],
         "latency_ms_token_mean": token_latency_stats["mean"],
-        "latency_ms_token_p50": token_latency_stats["p50"],
-        "latency_ms_token_p95": token_latency_stats["p95"],
         "throughput_tok_s_mean": throughput_stats["mean"],
-        "throughput_tok_s_p50": throughput_stats["p50"],
-        "throughput_tok_s_p95": throughput_stats["p95"],
         "peak_gpu_memory_mb_mean": memory_stats["mean"],
-        "peak_gpu_memory_mb_p50": memory_stats["p50"],
-        "peak_gpu_memory_mb_p95": memory_stats["p95"],
     }
+
+    if include_percentiles:
+        row.update(
+            {
+                "e2e_latency_s_p50": latency_stats["p50"],
+                "e2e_latency_s_p95": latency_stats["p95"],
+                "latency_ms_token_p50": token_latency_stats["p50"],
+                "latency_ms_token_p95": token_latency_stats["p95"],
+                "throughput_tok_s_p50": throughput_stats["p50"],
+                "throughput_tok_s_p95": throughput_stats["p95"],
+                "peak_gpu_memory_mb_p50": memory_stats["p50"],
+                "peak_gpu_memory_mb_p95": memory_stats["p95"],
+            }
+        )
+
+    return row
 
 
 def save_results(rows: list[dict[str, float | int | str]], artifacts_dir: Path) -> Path:
@@ -392,6 +406,7 @@ def main() -> None:
                 measure_runs=args.measure_runs,
                 device=args.device,
                 seed=args.seed + total_length,
+                include_percentiles=args.include_percentiles,
             )
 
         rows.append(row)
