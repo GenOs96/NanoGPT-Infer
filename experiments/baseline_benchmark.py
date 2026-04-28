@@ -320,41 +320,161 @@ def plot_results(rows: list[dict[str, float | int | str]], artifacts_dir: Path) 
     peak_memory = [float(row["peak_gpu_memory_mb_mean"]) for row in ok_rows]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 9), sharex=True)
-    color = "#2563eb"
+    colors = {
+        "latency": "#2563eb",
+        "token_latency": "#7c3aed",
+        "throughput": "#059669",
+        "memory": "#dc2626",
+    }
     grid_style = {"alpha": 0.25}
 
+    def fmt_value(value: float, unit: str) -> str:
+        if unit == "Seconds":
+            return f"{value:.2f}s"
+        if unit == "ms/token":
+            return f"{value:.1f}"
+        if unit == "tokens/sec":
+            return f"{value:.1f}"
+        if unit == "MB":
+            return f"{value:.0f}"
+        return f"{value:.2f}"
+
+    def pct_change(values: list[float]) -> str:
+        if not values or values[0] == 0.0:
+            return "n/a"
+        change = (values[-1] / values[0] - 1.0) * 100.0
+        sign = "+" if change >= 0 else ""
+        return f"{sign}{change:.1f}%"
+
+    def maybe_fill_percentile_band(
+        ax,
+        p50_key: str,
+        p95_key: str,
+        color: str,
+    ) -> None:
+        if p50_key not in ok_rows[0] or p95_key not in ok_rows[0]:
+            return
+        p50 = [float(row[p50_key]) for row in ok_rows]
+        p95 = [float(row[p95_key]) for row in ok_rows]
+        ax.fill_between(
+            total_lengths,
+            p50,
+            p95,
+            color=color,
+            alpha=0.12,
+            label="p50-p95",
+        )
+
     plots = [
-        (axes[0, 0], e2e_latency, "End-to-End Latency", "Seconds"),
-        (axes[0, 1], token_latency, "Latency Per Generated Token", "ms/token"),
-        (axes[1, 0], throughput, "Throughput", "tokens/sec"),
-        (axes[1, 1], peak_memory, "Peak GPU Memory", "MB"),
+        (
+            axes[0, 0],
+            e2e_latency,
+            "End-to-End Latency",
+            "Seconds",
+            colors["latency"],
+            "e2e_latency_s_p50",
+            "e2e_latency_s_p95",
+        ),
+        (
+            axes[0, 1],
+            token_latency,
+            "Latency Per Generated Token",
+            "ms/token",
+            colors["token_latency"],
+            "latency_ms_token_p50",
+            "latency_ms_token_p95",
+        ),
+        (
+            axes[1, 0],
+            throughput,
+            "Throughput",
+            "tokens/sec",
+            colors["throughput"],
+            "throughput_tok_s_p50",
+            "throughput_tok_s_p95",
+        ),
+        (
+            axes[1, 1],
+            peak_memory,
+            "Peak GPU Memory",
+            "MB",
+            colors["memory"],
+            "peak_gpu_memory_mb_p50",
+            "peak_gpu_memory_mb_p95",
+        ),
     ]
 
-    for ax, values, title, ylabel in plots:
-        ax.plot(total_lengths, values, marker="o", linewidth=2, color=color)
+    for ax, values, title, ylabel, color, p50_key, p95_key in plots:
+        maybe_fill_percentile_band(ax, p50_key, p95_key, color)
+        ax.plot(
+            total_lengths,
+            values,
+            marker="o",
+            markersize=6,
+            linewidth=2.4,
+            color=color,
+            label="mean",
+        )
         ax.set_title(title)
         ax.set_ylabel(ylabel)
         ax.grid(True, **grid_style)
+        ax.margins(x=0.05, y=0.18)
+        ax.text(
+            0.02,
+            0.95,
+            f"change: {pct_change(values)}",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=9,
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "facecolor": "white",
+                "alpha": 0.85,
+                "edgecolor": "#d1d5db",
+            },
+        )
+        for x_value, y_value in zip(total_lengths, values):
+            ax.annotate(
+                fmt_value(y_value, ylabel),
+                xy=(x_value, y_value),
+                xytext=(0, 7),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+                color=color,
+            )
+        ax.legend(loc="best", fontsize=8)
+
+    x_labels = [
+        f"{total}\n+{new_tokens} gen"
+        for total, new_tokens in zip(total_lengths, generated_tokens)
+    ]
+    for ax in axes.flat:
+        ax.set_xticks(total_lengths)
+        ax.set_xticklabels(x_labels)
 
     for ax in axes[1, :]:
-        ax.set_xlabel("Total context length (prompt + generated tokens)")
-
-    for idx, (total_length, new_tokens) in enumerate(zip(total_lengths, generated_tokens)):
-        axes[0, 0].annotate(
-            f"+{new_tokens}",
-            xy=(total_length, e2e_latency[idx]),
-            xytext=(0, 7),
-            textcoords="offset points",
-            ha="center",
-            fontsize=8,
-        )
+        ax.set_xlabel("Total context length and generated-token count")
 
     prompt_length = int(ok_rows[0]["prompt_length"])
     fig.suptitle(
-        f"Baseline generation benchmark (prompt={prompt_length} tokens)",
+        (
+            "Baseline no-cache generation benchmark "
+            f"(fixed prompt={prompt_length} tokens)"
+        ),
         fontsize=14,
     )
+    fig.text(
+        0.5,
+        0.01,
+        "Each point is the mean across measured runs. Labels below x-axis show total length and generated tokens.",
+        ha="center",
+        fontsize=9,
+        color="#4b5563",
+    )
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.13, top=0.90)
 
     png_path = artifacts_dir / "baseline_benchmark_results.png"
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
