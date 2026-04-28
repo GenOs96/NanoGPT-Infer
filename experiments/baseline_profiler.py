@@ -151,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-new-tokens",
         type=int,
-        default=1,
+        default=16,
         help="Number of new tokens to generate.",
     )
     parser.add_argument(
