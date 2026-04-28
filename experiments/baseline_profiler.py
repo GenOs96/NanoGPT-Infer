@@ -87,6 +87,24 @@ def build_model(model_name: str, device: str) -> GPT:
     return model
 
 
+def build_input_ids(
+    vocab_size: int,
+    batch_size: int,
+    prompt_length: int,
+    device: str,
+    seed: int,
+) -> torch.Tensor:
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return torch.randint(
+        0,
+        vocab_size,
+        (batch_size, prompt_length),
+        device=device,
+        generator=generator,
+    )
+
+
 @torch.inference_mode()
 def run_generation_workload(
     model: GPT,
@@ -145,13 +163,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default="Once upon a time",
-        help="Prompt used for generation.",
+        default="",
+        help=(
+            "Optional prompt text used for generation. "
+            "If omitted, random prompt tokens are generated with --prompt-length."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size to profile.",
+    )
+    parser.add_argument(
+        "--prompt-length",
+        type=int,
+        default=128,
+        help="Prompt token length to profile when --prompt is not provided.",
     )
     parser.add_argument(
         "--num-new-tokens",
         type=int,
-        default=16,
+        default=64,
         help="Number of new tokens to generate.",
     )
     parser.add_argument(
@@ -398,13 +431,16 @@ def print_nsight_commands(args: argparse.Namespace) -> None:
         "python experiments/baseline_profiler.py "
         f"--profile-tool none "
         f"--model-name {shlex.quote(args.model_name)} "
-        f"--prompt {shlex.quote(args.prompt)} "
+        f"--batch-size {args.batch_size} "
+        f"--prompt-length {args.prompt_length} "
         f"--num-new-tokens {args.num_new_tokens} "
         f"--device {shlex.quote(args.device)} "
         f"--warmup-steps {args.warmup_steps} "
         f"--active-steps {args.active_steps} "
         f"--seed {args.seed}"
     )
+    if args.prompt:
+        base_cmd += f" --prompt {shlex.quote(args.prompt)}"
     if args.mark_decode_steps:
         base_cmd += " --mark-decode-steps"
     if args.disable_nvtx:
@@ -451,7 +487,33 @@ def main() -> None:
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_name)
     model = build_model(args.model_name, device)
 
-    input_ids = tokenizer.encode(args.prompt, return_tensors="pt").to(device)
+    if args.prompt:
+        input_ids = tokenizer.encode(args.prompt, return_tensors="pt").to(device)
+        if input_ids.shape[1] > args.prompt_length:
+            raise ValueError(
+                f"prompt token length exceeds --prompt-length: "
+                f"{input_ids.shape[1]} > {args.prompt_length}"
+            )
+        if input_ids.shape[1] < args.prompt_length:
+            # If a shorter prompt is provided, pad with random tokens to match prompt-length.
+            pad_ids = build_input_ids(
+                tokenizer.vocab_size,
+                args.batch_size,
+                args.prompt_length - input_ids.shape[1],
+                device,
+                args.seed + 1,
+            )
+            pad_ids = pad_ids[:, : args.prompt_length - input_ids.shape[1]]
+            input_ids = torch.cat([input_ids.repeat(args.batch_size, 1) if args.batch_size > 1 else input_ids, pad_ids], dim=1)
+    else:
+        input_ids = build_input_ids(
+            tokenizer.vocab_size,
+            args.batch_size,
+            args.prompt_length,
+            device,
+            args.seed,
+        )
+
     max_context_len = input_ids.shape[1] + args.num_new_tokens
     if max_context_len > model.config.block_size:
         raise ValueError(
