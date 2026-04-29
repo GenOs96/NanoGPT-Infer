@@ -28,13 +28,13 @@ DEFAULT_SEED = 1234
 DEFAULT_DTYPE = torch.float32
 
 FIXED_PROMPT_VARY_DECODE = [
-    (128, 16),
     (128, 64),
     (128, 128),
     (128, 256),
+    (128, 512),
 ]
 FIXED_DECODE_VARY_PROMPT = [
-    (32, 64),
+    (64, 64),
     (128, 64),
     (512, 64),
     (768, 64),
@@ -572,8 +572,9 @@ def plot_phase_breakdown(ax, rows: list[dict[str, float | int | str]]) -> None:
         return
 
     labels = []
-    prefill = []
-    decode = []
+    prefill_ms = []
+    decode_ms = []
+    ratios = []
     for prompt_len, generated_tokens in PREFILL_DECODE_BREAKDOWN:
         for mode in ["no_cache", "kv_cache"]:
             matching = [
@@ -586,14 +587,40 @@ def plot_phase_breakdown(ax, rows: list[dict[str, float | int | str]]) -> None:
             decode_row = next((row for row in matching if row["phase"] == "decode"), None)
             if prefill_row and decode_row:
                 labels.append(f"{mode}\np{prompt_len}/g{generated_tokens}")
-                prefill.append(float(prefill_row["latency_s_mean"]))
-                decode.append(float(decode_row["latency_s_mean"]))
+                prefill_latency_ms = float(prefill_row["latency_s_mean"]) * 1000.0
+                decode_latency_ms = float(decode_row["latency_s_mean"]) * 1000.0
+                prefill_ms.append(prefill_latency_ms)
+                decode_ms.append(decode_latency_ms)
+                ratios.append(decode_latency_ms / prefill_latency_ms)
 
     x_values = list(range(len(labels)))
-    ax.bar(x_values, prefill, color="#7570b3", label="prefill")
-    ax.bar(x_values, decode, bottom=prefill, color="#e7298a", label="decode")
+    width = 0.38
+    ax.bar(
+        [x - width / 2 for x in x_values],
+        prefill_ms,
+        width=width,
+        color="#7570b3",
+        label="prefill",
+    )
+    ax.bar(
+        [x + width / 2 for x in x_values],
+        decode_ms,
+        width=width,
+        color="#e7298a",
+        label="decode",
+    )
+    for x, decode_latency_ms, ratio in zip(x_values, decode_ms, ratios):
+        ax.text(
+            x + width / 2,
+            decode_latency_ms,
+            f"{ratio:.0f}x",
+            ha="center",
+            va="bottom",
+            fontsize=7,
+        )
     ax.set_title("Prefill vs Decode Latency")
-    ax.set_ylabel("Seconds")
+    ax.set_ylabel("Milliseconds (log scale)")
+    ax.set_yscale("log")
     ax.set_xticks(x_values)
     ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
     ax.grid(True, axis="y", alpha=0.25)
