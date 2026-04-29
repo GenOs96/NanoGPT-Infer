@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 import random
+import shlex
 import sys
 import time
 from contextlib import contextmanager, nullcontext
@@ -11,6 +12,7 @@ import torch
 from torch.profiler import (
     ProfilerActivity,
     profile,
+    record_function,
     schedule,
     tensorboard_trace_handler,
 )
@@ -60,22 +62,42 @@ def parse_args() -> argparse.Namespace:
         help="Hugging Face model name to load.",
     )
     parser.add_argument(
-        "--prompt-lengths",
-        type=parse_int_list,
-        default=[128, 512],
-        help="Comma-separated prompt lengths to sweep, for example 128,512.",
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size to profile.",
+    )
+    parser.add_argument(
+        "--prompt-length",
+        type=int,
+        default=128,
+        help="Prompt token length to profile.",
+    )
+    parser.add_argument(
+        "--num-new-tokens",
+        "--max-new-tokens",
+        dest="num_new_tokens",
+        type=int,
+        default=64,
+        help="Number of new tokens to generate after prefill.",
     )
     parser.add_argument(
         "--batch-sizes",
         type=parse_int_list,
-        default=[1, 4],
-        help="Comma-separated batch sizes to sweep, for example 1,4.",
+        default=None,
+        help=(
+            "Optional comma-separated batch sizes to sweep. "
+            "Overrides --batch-size when provided."
+        ),
     )
     parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=64,
-        help="Number of decode tokens to generate after prefill.",
+        "--prompt-lengths",
+        type=parse_int_list,
+        default=None,
+        help=(
+            "Optional comma-separated prompt lengths to sweep. "
+            "Overrides --prompt-length when provided."
+        ),
     )
     parser.add_argument(
         "--warmup-steps",
@@ -117,6 +139,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of rows to print in the PyTorch Profiler summary table.",
     )
     return parser.parse_args()
+
+
+def get_profile_configs(args: argparse.Namespace) -> tuple[list[int], list[int], int]:
+    prompt_lengths = args.prompt_lengths if args.prompt_lengths else [args.prompt_length]
+    batch_sizes = args.batch_sizes if args.batch_sizes else [args.batch_size]
+    return prompt_lengths, batch_sizes, args.num_new_tokens
 
 
 def get_dtype() -> torch.dtype:
@@ -162,6 +190,13 @@ def nvtx_range(name: str, enabled: bool):
             torch.cuda.nvtx.range_pop()
     else:
         yield
+
+
+@contextmanager
+def profiler_range(name: str, enable_nvtx: bool):
+    with record_function(name):
+        with nvtx_range(name, enable_nvtx):
+            yield
 
 
 def build_model(model_name: str, device: str) -> GPT:
@@ -225,19 +260,20 @@ def run_kv_cache_workload(
     tokens = input_ids.clone()
     kv_cache = build_kv_cache(model, batch_size, max_context_len, str(tokens.device))
 
-    range_name = f"kv_cache_workload_b{batch_size}_s{prompt_length}_d{max_new_tokens}"
-    with nvtx_range(range_name, enable_nvtx):
-        with nvtx_range("prefill", enable_nvtx):
+    range_name = f"kv_cache_generate_b{batch_size}_s{prompt_length}_d{max_new_tokens}"
+    with profiler_range(range_name, enable_nvtx):
+        with profiler_range("prefill", enable_nvtx):
             logits = model(tokens, kv_cache=kv_cache)
 
-        with nvtx_range("decode", enable_nvtx):
+        with profiler_range("decode", enable_nvtx):
             for step in range(max_new_tokens):
-                with nvtx_range("decode_step", enable_nvtx):
+                with profiler_range("decode_step", enable_nvtx):
                     step_name = f"decode_step_{step}" if mark_decode_steps else None
-                    with nvtx_range(step_name, enable_nvtx) if step_name else nullcontext():
+                    with profiler_range(step_name, enable_nvtx) if step_name else nullcontext():
                         next_token = sample_logits(logits)
                         tokens = torch.cat([tokens, next_token], dim=1)
-                        logits = model(next_token, kv_cache=kv_cache)
+                        if step < max_new_tokens - 1:
+                            logits = model(next_token, kv_cache=kv_cache)
 
     return tokens
 
@@ -309,7 +345,7 @@ def run_torch_profile_config(
     if device.startswith("cuda") and torch.cuda.is_available():
         activities.append(ProfilerActivity.CUDA)
 
-    run_name = f"kv_b{batch_size}_s{prompt_length}_d{max_new_tokens}_{device.replace(':', '_')}"
+    run_name = f"kv_cache_b{batch_size}_s{prompt_length}_d{max_new_tokens}_{device.replace(':', '_')}"
     total_steps = warmup_steps + active_steps
     timed_steps = []
     peak_memories = []
@@ -421,7 +457,7 @@ def run_unprofiled_config(
         "throughput_mean_tokens_per_sec": summarize(throughput)["mean"],
         "peak_cuda_memory_mb": summarize(active_peak_memories)["max"],
         "trace_dir": "",
-        "run_name": f"kv_b{batch_size}_s{prompt_length}_d{max_new_tokens}",
+        "run_name": f"kv_cache_b{batch_size}_s{prompt_length}_d{max_new_tokens}",
     }
 
 
@@ -435,33 +471,50 @@ def save_summary_csv(rows: list[dict[str, float | int | str]], profile_tool: str
 
 
 def print_nsight_commands(args: argparse.Namespace) -> None:
-    prompt_lengths = ",".join(str(x) for x in args.prompt_lengths)
-    batch_sizes = ",".join(str(x) for x in args.batch_sizes)
+    prompt_lengths, batch_sizes, num_new_tokens = get_profile_configs(args)
+    use_sweep_args = len(prompt_lengths) > 1 or len(batch_sizes) > 1
+
     base_cmd = (
         "python experiments/kv_cache_profiler.py "
         f"--profile-tool none "
-        f"--prompt-lengths {prompt_lengths} "
-        f"--batch-sizes {batch_sizes} "
-        f"--max-new-tokens {args.max_new_tokens} "
+        f"--model-name {shlex.quote(args.model_name)} "
+        f"--num-new-tokens {num_new_tokens} "
+        f"--device {shlex.quote(args.device)} "
         f"--warmup-steps {args.warmup_steps} "
-        f"--active-steps {args.active_steps}"
+        f"--active-steps {args.active_steps} "
+        f"--seed {args.seed}"
     )
+    if use_sweep_args:
+        base_cmd += (
+            f" --prompt-lengths {','.join(str(x) for x in prompt_lengths)} "
+            f"--batch-sizes {','.join(str(x) for x in batch_sizes)}"
+        )
+    else:
+        base_cmd += (
+            f" --prompt-length {prompt_lengths[0]} "
+            f"--batch-size {batch_sizes[0]}"
+        )
     if args.mark_decode_steps:
         base_cmd += " --mark-decode-steps"
     if args.disable_nvtx:
         base_cmd += " --disable-nvtx"
 
+    shape_name = (
+        f"b{batch_sizes[0]}_s{prompt_lengths[0]}_d{num_new_tokens}"
+        if not use_sweep_args
+        else "sweep"
+    )
     nsys_cmd = (
         "nsys profile --trace=cuda,nvtx,osrt "
         "--sample=none "
-        "--output experiments/artifacts/kv_cache_profiler/nsys_kv_cache_timeline "
+        f"--output experiments/artifacts/kv_cache_profiler/nsys_kv_cache_{shape_name} "
         + base_cmd
     )
     ncu_cmd = (
         "ncu --set full "
         "--nvtx "
         "--nvtx-include decode_step "
-        "--export experiments/artifacts/kv_cache_profiler/ncu_kv_cache_decode "
+        f"--export experiments/artifacts/kv_cache_profiler/ncu_kv_cache_decode_{shape_name} "
         + base_cmd
     )
 
@@ -473,29 +526,50 @@ def print_nsight_commands(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.prompt_length <= 0:
+        raise ValueError("--prompt-length must be positive")
+    if args.num_new_tokens < 0:
+        raise ValueError("--num-new-tokens must be non-negative")
+    if args.warmup_steps < 0:
+        raise ValueError("--warmup-steps must be non-negative")
+    if args.active_steps <= 0:
+        raise ValueError("--active-steps must be positive")
+
     artifacts_dir = get_artifacts_dir()
     enable_nvtx = not args.disable_nvtx and args.device.startswith("cuda") and torch.cuda.is_available()
+    prompt_lengths, batch_sizes, num_new_tokens = get_profile_configs(args)
 
     print(f"Using device: {args.device}")
     print(f"Artifacts dir: {artifacts_dir}")
-    print(f"Prompt lengths: {args.prompt_lengths}")
-    print(f"Batch sizes: {args.batch_sizes}")
-    print(f"Max new tokens: {args.max_new_tokens}")
+    print(f"Prompt lengths: {prompt_lengths}")
+    print(f"Batch sizes: {batch_sizes}")
+    print(f"Num new tokens: {num_new_tokens}")
     print(f"Warmup steps: {args.warmup_steps}, active steps: {args.active_steps}")
 
     set_seed(args.seed)
     model = build_model(args.model_name, args.device)
     rows = []
+    is_sweep = len(prompt_lengths) > 1 or len(batch_sizes) > 1
 
-    for prompt_length in args.prompt_lengths:
-        for batch_size in args.batch_sizes:
-            if prompt_length + args.max_new_tokens > model.config.block_size:
+    for prompt_length in prompt_lengths:
+        for batch_size in batch_sizes:
+            if prompt_length <= 0:
+                raise ValueError("all prompt lengths must be positive")
+            if batch_size <= 0:
+                raise ValueError("all batch sizes must be positive")
+            if prompt_length + num_new_tokens > model.config.block_size:
                 raise ValueError(
-                    f"prompt_length + max_new_tokens exceeds block size: "
-                    f"{prompt_length} + {args.max_new_tokens} > {model.config.block_size}"
+                    f"prompt_length + num_new_tokens exceeds block size: "
+                    f"{prompt_length} + {num_new_tokens} > {model.config.block_size}"
                 )
 
-            config_seed = args.seed + prompt_length * 100 + batch_size
+            config_seed = (
+                args.seed + prompt_length * 100 + batch_size
+                if is_sweep
+                else args.seed
+            )
             input_ids = build_input_ids(
                 vocab_size=model.config.vocab_size,
                 batch_size=batch_size,
@@ -506,7 +580,7 @@ def main() -> None:
 
             print(
                 f"\nRunning config: batch_size={batch_size}, "
-                f"prompt_length={prompt_length}, max_new_tokens={args.max_new_tokens}"
+                f"prompt_length={prompt_length}, num_new_tokens={num_new_tokens}"
             )
             if args.profile_tool == "torch":
                 row = run_torch_profile_config(
@@ -514,7 +588,7 @@ def main() -> None:
                     input_ids=input_ids,
                     batch_size=batch_size,
                     prompt_length=prompt_length,
-                    max_new_tokens=args.max_new_tokens,
+                    max_new_tokens=num_new_tokens,
                     warmup_steps=args.warmup_steps,
                     active_steps=args.active_steps,
                     enable_nvtx=enable_nvtx,
@@ -530,7 +604,7 @@ def main() -> None:
                     input_ids=input_ids,
                     batch_size=batch_size,
                     prompt_length=prompt_length,
-                    max_new_tokens=args.max_new_tokens,
+                    max_new_tokens=num_new_tokens,
                     warmup_steps=args.warmup_steps,
                     active_steps=args.active_steps,
                     enable_nvtx=enable_nvtx,
