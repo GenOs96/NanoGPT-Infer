@@ -63,13 +63,13 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T, self.n_head, self.head_dim)
             v = v.view(B, T, self.n_head, self.head_dim)
 
-            if kv_cache is not None:
-                with record_function("kv_cache"):
-                    k, v = kv_cache.update(layer_idx, k, v)
-
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
+
+            if kv_cache is not None:
+                with record_function("kv_cache"):
+                    k, v = kv_cache.update(layer_idx, k, v)
 
             att = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
