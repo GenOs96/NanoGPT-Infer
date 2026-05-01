@@ -54,14 +54,10 @@ class CausalSelfAttention(nn.Module):
         )
 
         with record_function(attn_scope):
-            qkv = self.qkv(x)
-            q, k, v = qkv.split(C, dim=2)
+            B, T, C = x.shape
 
-            # Always move q/k/v into (B, T, n_head, head_dim) first so both
-            # cached and non-cached paths share identical tensor layouts.
-            q = q.view(B, T, self.n_head, self.head_dim)
-            k = k.view(B, T, self.n_head, self.head_dim)
-            v = v.view(B, T, self.n_head, self.head_dim)
+            qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
+            q, k, v = qkv.unbind(dim=2)
 
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
@@ -70,8 +66,10 @@ class CausalSelfAttention(nn.Module):
             if kv_cache is not None:
                 with record_function("kv_cache"):
                     k, v = kv_cache.update(layer_idx, k, v)
+            else:
+                k = k.transpose(-2, -1)
 
-            att = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            att = (q @ k) / (self.head_dim ** 0.5)
 
             if kv_cache is None:
                 # training / no cache
@@ -81,7 +79,7 @@ class CausalSelfAttention(nn.Module):
                 )
             else:
                 # cache mode: source length can exceed query length
-                S = k.size(-2)
+                S = k.size(-1)
                 q_start = S - T
                 att = att.masked_fill(
                     self.mask[:, :, q_start:S, :S] == 0,
