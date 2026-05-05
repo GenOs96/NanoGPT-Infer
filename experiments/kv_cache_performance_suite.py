@@ -164,6 +164,7 @@ def build_model(model_name: str, device: str) -> GPT:
     load_hf_weights(model, hf_model)
     model = model.to(device=device, dtype=DEFAULT_DTYPE)
     model.eval()
+    model = torch.compile(model, mode="reduce-overhead")
     return model
 
 
