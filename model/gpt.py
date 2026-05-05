@@ -55,7 +55,8 @@ class CausalSelfAttention(nn.Module):
 
         with record_function(attn_scope):
             B, T, C = x.shape
-
+            is_decoding = False
+            
             qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_dim)
             q, k, v = qkv.unbind(dim=2)
 
@@ -66,14 +67,16 @@ class CausalSelfAttention(nn.Module):
             if kv_cache is not None:
                 with record_function("kv_cache"):
                     k, v = kv_cache.update(layer_idx, k, v)
+                if q.size(2) == 1:
+                    is_decoding = True
             
             y = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None,
                 dropout_p=0.0,
-                is_causal=True
+                is_causal=not is_decoding
             )
-            
+
             y = y.transpose(1, 2).contiguous().view(B, T, C)
 
             return self.proj(y)
