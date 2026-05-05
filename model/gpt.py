@@ -66,29 +66,14 @@ class CausalSelfAttention(nn.Module):
             if kv_cache is not None:
                 with record_function("kv_cache"):
                     k, v = kv_cache.update(layer_idx, k, v)
-            else:
-                k = k.transpose(-2, -1)
-
-            att = (q @ k) / (self.head_dim ** 0.5)
-
-            if kv_cache is None:
-                # training / no cache
-                att = att.masked_fill(
-                    self.mask[:, :, :T, :T] == 0,
-                    float("-inf"),
-                )
-            else:
-                # cache mode: source length can exceed query length
-                S = k.size(-1)
-                q_start = S - T
-                att = att.masked_fill(
-                    self.mask[:, :, q_start:S, :S] == 0,
-                    float("-inf"),
-                )
-
-            att = F.softmax(att, dim=-1)
-
-            y = att @ v
+            
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=True
+            )
+            
             y = y.transpose(1, 2).contiguous().view(B, T, C)
 
             return self.proj(y)

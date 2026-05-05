@@ -4,7 +4,7 @@ class KVCache:
     def __init__(self, n_layer, batch_size, n_head, max_seq_len, head_dim, device):
 
         self.k_cache = [
-            torch.zeros(batch_size, n_head, head_dim, max_seq_len, device=device)
+            torch.zeros(batch_size, n_head, max_seq_len, head_dim, device=device)
             for _ in range(n_layer)
         ]
         self.v_cache = [
@@ -52,12 +52,12 @@ class KVCache:
                 f"but max_seq_len={cache_max_t}"
             )
 
-        self.k_cache[layer_idx][:, :, :, start:end] = k_update.transpose(-2, -1)
+        self.k_cache[layer_idx][:, :, start:end, :] = k_update
         self.v_cache[layer_idx][:, :, start:end, :] = v_update
 
         if layer_idx == 0: 
             self.current_seq_len = end
 
-        k = self.k_cache[layer_idx][:, :, :, :self.current_seq_len]
+        k = self.k_cache[layer_idx][:, :, :self.current_seq_len, :]
         v = self.v_cache[layer_idx][:, :, :self.current_seq_len, :]
         return k, v
