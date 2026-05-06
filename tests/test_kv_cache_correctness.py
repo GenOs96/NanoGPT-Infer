@@ -102,6 +102,57 @@ class KVCacheCorrectnessTest(unittest.TestCase):
         self.assertTrue(torch.equal(cached_tokens, no_cache_tokens))
         self.assertEqual(cached_tokens.shape, (1, max_context_len))
 
+    @unittest.skipUnless(hasattr(torch, "compile"), "torch.compile is unavailable")
+    def test_torch_compile_kv_cache_logits_match_eager_no_cache_logits(self) -> None:
+        baseline_model = build_tiny_model()
+        kv_cache_source_model = build_tiny_model()
+        try:
+            compiled_kv_cache_model = torch.compile(
+                kv_cache_source_model,
+                mode="reduce-overhead",
+            )
+        except Exception as exc:
+            raise unittest.SkipTest(f"torch.compile is unavailable: {exc}") from exc
+
+        prompt = torch.tensor([[1, 4, 8, 12]], dtype=torch.long)
+        decode_tokens = torch.tensor([[6, 3, 9]], dtype=torch.long)
+        kv_cache = build_kv_cache(
+            model=kv_cache_source_model,
+            batch_size=prompt.shape[0],
+            max_seq_len=prompt.shape[1] + decode_tokens.shape[1],
+        )
+
+        with torch.inference_mode():
+            full_context = prompt
+            baseline_logits = baseline_model(full_context)
+            cached_logits = compiled_kv_cache_model(full_context, kv_cache=kv_cache)
+
+            torch.testing.assert_close(
+                cached_logits,
+                baseline_logits,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+
+            for token_idx in range(decode_tokens.shape[1]):
+                next_token = decode_tokens[:, token_idx : token_idx + 1]
+                full_context = torch.cat([full_context, next_token], dim=1)
+
+                baseline_logits = baseline_model(full_context)
+                cached_logits = compiled_kv_cache_model(
+                    next_token,
+                    kv_cache=kv_cache,
+                )
+
+                torch.testing.assert_close(
+                    cached_logits[:, -1, :],
+                    baseline_logits[:, -1, :],
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+
+        self.assertEqual(kv_cache.current_seq_len, full_context.shape[1])
+
 
 if __name__ == "__main__":
     unittest.main()
