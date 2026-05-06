@@ -164,8 +164,11 @@ def build_model(model_name: str, device: str) -> GPT:
     load_hf_weights(model, hf_model)
     model = model.to(device=device, dtype=DEFAULT_DTYPE)
     model.eval()
-    model = torch.compile(model, mode="reduce-overhead")
     return model
+
+
+def compile_kv_cache_model(model: GPT) -> GPT:
+    return torch.compile(model, mode="reduce-overhead")
 
 
 def make_input_ids(
@@ -240,6 +243,7 @@ def generate_with_kv_cache(
 
 def run_e2e_once(
     model: GPT,
+    kv_cache_model: GPT,
     input_ids: torch.Tensor,
     generated_tokens: int,
     mode: str,
@@ -247,13 +251,14 @@ def run_e2e_once(
     if mode == "no_cache":
         return generate_no_cache(model, input_ids, generated_tokens)
     if mode == "kv_cache":
-        return generate_with_kv_cache(model, input_ids, generated_tokens)
+        return generate_with_kv_cache(kv_cache_model, input_ids, generated_tokens)
     raise ValueError(f"Unknown mode: {mode}")
 
 
 def benchmark_e2e_config(
     test_name: str,
     model: GPT,
+    kv_cache_model: GPT,
     input_ids: torch.Tensor,
     generated_tokens: int,
     mode: str,
@@ -267,7 +272,7 @@ def benchmark_e2e_config(
 
     for run_idx in range(warmup_runs):
         set_seed(seed + run_idx)
-        _ = run_e2e_once(model, input_ids, generated_tokens, mode)
+        _ = run_e2e_once(model, kv_cache_model, input_ids, generated_tokens, mode)
 
     timings = []
     peak_memories = []
@@ -276,7 +281,7 @@ def benchmark_e2e_config(
         sync_if_needed(device)
         reset_peak_memory_if_needed(device)
         start = time.perf_counter()
-        _ = run_e2e_once(model, input_ids, generated_tokens, mode)
+        _ = run_e2e_once(model, kv_cache_model, input_ids, generated_tokens, mode)
         sync_if_needed(device)
         end = time.perf_counter()
         timings.append(end - start)
@@ -309,6 +314,7 @@ def benchmark_e2e_config(
 @torch.inference_mode()
 def run_phase_once(
     model: GPT,
+    kv_cache_model: GPT,
     input_ids: torch.Tensor,
     generated_tokens: int,
     mode: str,
@@ -319,17 +325,19 @@ def run_phase_once(
     sync_if_needed(device)
     prefill_start = time.perf_counter()
     if mode == "kv_cache":
+        active_model = kv_cache_model
         batch_size, prompt_len = tokens.shape
         kv_cache = build_kv_cache(
-            model,
+            active_model,
             batch_size,
             prompt_len + generated_tokens,
             str(tokens.device),
         )
-        logits = model(tokens, kv_cache=kv_cache)
+        logits = active_model(tokens, kv_cache=kv_cache)
     else:
+        active_model = model
         kv_cache = None
-        logits = model(tokens)
+        logits = active_model(tokens)
     sync_if_needed(device)
     prefill_end = time.perf_counter()
 
@@ -340,9 +348,9 @@ def run_phase_once(
         tokens = torch.cat([tokens, next_token], dim=1)
         if step < generated_tokens - 1:
             if mode == "kv_cache":
-                logits = model(next_token, kv_cache=kv_cache)
+                logits = active_model(next_token, kv_cache=kv_cache)
             else:
-                logits = model(tokens)
+                logits = active_model(tokens)
     sync_if_needed(device)
     decode_end = time.perf_counter()
 
@@ -351,6 +359,7 @@ def run_phase_once(
 
 def benchmark_phase_config(
     model: GPT,
+    kv_cache_model: GPT,
     input_ids: torch.Tensor,
     generated_tokens: int,
     mode: str,
@@ -364,7 +373,14 @@ def benchmark_phase_config(
 
     for run_idx in range(warmup_runs):
         set_seed(seed + run_idx)
-        _ = run_phase_once(model, input_ids, generated_tokens, mode, device)
+        _ = run_phase_once(
+            model,
+            kv_cache_model,
+            input_ids,
+            generated_tokens,
+            mode,
+            device,
+        )
 
     prefill_timings = []
     decode_timings = []
@@ -374,6 +390,7 @@ def benchmark_phase_config(
         reset_peak_memory_if_needed(device)
         prefill_latency, decode_latency = run_phase_once(
             model,
+            kv_cache_model,
             input_ids,
             generated_tokens,
             mode,
@@ -424,6 +441,7 @@ def run_e2e_suite(
     test_name: str,
     configs: list[tuple[int, int, int]],
     model: GPT,
+    kv_cache_model: GPT,
     vocab_size: int,
     args: argparse.Namespace,
 ) -> list[dict[str, float | int | str]]:
@@ -446,6 +464,7 @@ def run_e2e_suite(
                 benchmark_e2e_config(
                     test_name=test_name,
                     model=model,
+                    kv_cache_model=kv_cache_model,
                     input_ids=input_ids,
                     generated_tokens=generated_tokens,
                     mode=mode,
@@ -460,6 +479,7 @@ def run_e2e_suite(
 
 def run_phase_suite(
     model: GPT,
+    kv_cache_model: GPT,
     vocab_size: int,
     args: argparse.Namespace,
 ) -> list[dict[str, float | int | str]]:
@@ -481,6 +501,7 @@ def run_phase_suite(
             rows.extend(
                 benchmark_phase_config(
                     model=model,
+                    kv_cache_model=kv_cache_model,
                     input_ids=input_ids,
                     generated_tokens=generated_tokens,
                     mode=mode,
@@ -707,6 +728,7 @@ def main() -> None:
 
     set_seed(args.seed)
     model = build_model(args.model_name, args.device)
+    kv_cache_model = compile_kv_cache_model(model)
     if args.max_context_len > model.config.block_size:
         raise ValueError(
             f"max_context_len={args.max_context_len} exceeds "
@@ -719,6 +741,7 @@ def main() -> None:
             "fixed_prompt_vary_decode",
             [(prompt, gen, 1) for prompt, gen in FIXED_PROMPT_VARY_DECODE],
             model,
+            kv_cache_model,
             model.config.vocab_size,
             args,
         )
@@ -728,18 +751,22 @@ def main() -> None:
             "fixed_decode_vary_prompt",
             [(prompt, gen, 1) for prompt, gen in FIXED_DECODE_VARY_PROMPT],
             model,
+            kv_cache_model,
             model.config.vocab_size,
             args,
         )
     )
     if args.include_phase_test:
-        rows.extend(run_phase_suite(model, model.config.vocab_size, args))
+        rows.extend(
+            run_phase_suite(model, kv_cache_model, model.config.vocab_size, args)
+        )
     if args.include_batch_test:
         rows.extend(
             run_e2e_suite(
                 "batch_sweep",
                 BATCH_SWEEP,
                 model,
+                kv_cache_model,
                 model.config.vocab_size,
                 args,
             )
