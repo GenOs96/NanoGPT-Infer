@@ -218,6 +218,10 @@ def build_model(model_name: str, device: str) -> GPT:
     return model
 
 
+def compile_kv_cache_model(model: GPT) -> GPT:
+    return torch.compile(model, mode="reduce-overhead")
+
+
 def build_input_ids(
     vocab_size: int,
     batch_size: int,
@@ -236,13 +240,18 @@ def build_input_ids(
     )
 
 
-def build_kv_cache(model: GPT, batch_size: int, max_context_len: int, device: str) -> KVCache:
+def build_kv_cache(
+    config: GPTConfig,
+    batch_size: int,
+    max_context_len: int,
+    device: str,
+) -> KVCache:
     return KVCache(
-        n_layer=model.config.n_layer,
+        n_layer=config.n_layer,
         batch_size=batch_size,
-        n_head=model.config.n_head,
+        n_head=config.n_head,
         max_seq_len=max_context_len,
-        head_dim=model.config.n_embd // model.config.n_head,
+        head_dim=config.n_embd // config.n_head,
         device=device,
     )
 
@@ -250,6 +259,7 @@ def build_kv_cache(model: GPT, batch_size: int, max_context_len: int, device: st
 @torch.inference_mode()
 def run_kv_cache_workload(
     model: GPT,
+    config: GPTConfig,
     input_ids: torch.Tensor,
     max_new_tokens: int,
     enable_nvtx: bool,
@@ -258,7 +268,7 @@ def run_kv_cache_workload(
     batch_size, prompt_length = input_ids.shape
     max_context_len = prompt_length + max_new_tokens
     tokens = input_ids.clone()
-    kv_cache = build_kv_cache(model, batch_size, max_context_len, str(tokens.device))
+    kv_cache = build_kv_cache(config, batch_size, max_context_len, str(tokens.device))
 
     range_name = f"kv_cache_generate_b{batch_size}_s{prompt_length}_d{max_new_tokens}"
     with profiler_range(range_name, enable_nvtx):
@@ -290,6 +300,7 @@ def summarize(values: list[float]) -> dict[str, float]:
 
 def run_timed_steps(
     model: GPT,
+    config: GPTConfig,
     input_ids: torch.Tensor,
     max_new_tokens: int,
     warmup_steps: int,
@@ -310,6 +321,7 @@ def run_timed_steps(
         start = time.perf_counter()
         _ = run_kv_cache_workload(
             model=model,
+            config=config,
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
             enable_nvtx=enable_nvtx,
@@ -325,6 +337,7 @@ def run_timed_steps(
 
 def run_torch_profile_config(
     model: GPT,
+    config: GPTConfig,
     input_ids: torch.Tensor,
     batch_size: int,
     prompt_length: int,
@@ -366,6 +379,7 @@ def run_torch_profile_config(
             start = time.perf_counter()
             _ = run_kv_cache_workload(
                 model=model,
+                config=config,
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
                 enable_nvtx=enable_nvtx,
@@ -412,6 +426,7 @@ def run_torch_profile_config(
 
 def run_unprofiled_config(
     model: GPT,
+    config: GPTConfig,
     input_ids: torch.Tensor,
     batch_size: int,
     prompt_length: int,
@@ -425,6 +440,7 @@ def run_unprofiled_config(
 ) -> dict[str, float | int | str]:
     active_timings, active_peak_memories = run_timed_steps(
         model=model,
+        config=config,
         input_ids=input_ids,
         max_new_tokens=max_new_tokens,
         warmup_steps=warmup_steps,
@@ -550,6 +566,7 @@ def main() -> None:
 
     set_seed(args.seed)
     model = build_model(args.model_name, args.device)
+    kv_cache_model = compile_kv_cache_model(model)
     rows = []
     is_sweep = len(prompt_lengths) > 1 or len(batch_sizes) > 1
 
@@ -584,7 +601,8 @@ def main() -> None:
             )
             if args.profile_tool == "torch":
                 row = run_torch_profile_config(
-                    model=model,
+                    model=kv_cache_model,
+                    config=model.config,
                     input_ids=input_ids,
                     batch_size=batch_size,
                     prompt_length=prompt_length,
@@ -600,7 +618,8 @@ def main() -> None:
                 )
             else:
                 row = run_unprofiled_config(
-                    model=model,
+                    model=kv_cache_model,
+                    config=model.config,
                     input_ids=input_ids,
                     batch_size=batch_size,
                     prompt_length=prompt_length,
