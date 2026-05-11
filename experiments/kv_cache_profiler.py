@@ -7,6 +7,7 @@ import sys
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from typing import Callable
 
 import torch
 from torch.profiler import (
@@ -232,8 +233,20 @@ def build_model(model_name: str, device: str) -> GPT:
     return model
 
 
-def compile_kv_cache_model(model: GPT) -> GPT:
-    return torch.compile(model, mode="reduce-overhead")
+KVCacheForward = Callable[[torch.Tensor, KVCache], torch.Tensor]
+
+
+def compile_kv_cache_forwards(model: GPT) -> tuple[KVCacheForward, KVCacheForward]:
+    def prefill(tokens: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
+        return model(tokens, kv_cache=kv_cache)
+
+    def decode(next_token: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
+        return model(next_token, kv_cache=kv_cache)
+
+    return (
+        torch.compile(prefill, mode="reduce-overhead"),
+        torch.compile(decode, mode="reduce-overhead"),
+    )
 
 
 def build_input_ids(
@@ -272,7 +285,8 @@ def build_kv_cache(
 
 @torch.inference_mode()
 def run_kv_cache_workload(
-    model: GPT,
+    prefill_forward: KVCacheForward,
+    decode_forward: KVCacheForward,
     config: GPTConfig,
     input_ids: torch.Tensor,
     max_new_tokens: int,
@@ -287,7 +301,7 @@ def run_kv_cache_workload(
     range_name = f"kv_cache_generate_b{batch_size}_s{prompt_length}_d{max_new_tokens}"
     with profiler_range(range_name, enable_nvtx):
         with profiler_range("prefill", enable_nvtx):
-            logits = model(tokens, kv_cache=kv_cache)
+            logits = prefill_forward(tokens, kv_cache)
 
         with profiler_range("decode", enable_nvtx):
             for step in range(max_new_tokens):
@@ -297,7 +311,7 @@ def run_kv_cache_workload(
                         next_token = sample_logits(logits)
                         tokens = torch.cat([tokens, next_token], dim=1)
                         if step < max_new_tokens - 1:
-                            logits = model(next_token, kv_cache=kv_cache)
+                            logits = decode_forward(next_token, kv_cache)
 
     return tokens
 
@@ -313,7 +327,8 @@ def summarize(values: list[float]) -> dict[str, float]:
 
 
 def run_timed_steps(
-    model: GPT,
+    prefill_forward: KVCacheForward,
+    decode_forward: KVCacheForward,
     config: GPTConfig,
     input_ids: torch.Tensor,
     max_new_tokens: int,
@@ -330,7 +345,8 @@ def run_timed_steps(
     for step in range(warmup_steps):
         set_seed(seed + step)
         _ = run_kv_cache_workload(
-            model=model,
+            prefill_forward=prefill_forward,
+            decode_forward=decode_forward,
             config=config,
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
@@ -346,7 +362,8 @@ def run_timed_steps(
             reset_peak_memory_if_needed(device)
             start = time.perf_counter()
             _ = run_kv_cache_workload(
-                model=model,
+                prefill_forward=prefill_forward,
+                decode_forward=decode_forward,
                 config=config,
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
@@ -362,7 +379,8 @@ def run_timed_steps(
 
 
 def run_timed_steps_with_profiler_schedule(
-    model: GPT,
+    prefill_forward: KVCacheForward,
+    decode_forward: KVCacheForward,
     config: GPTConfig,
     input_ids: torch.Tensor,
     max_new_tokens: int,
@@ -384,7 +402,8 @@ def run_timed_steps_with_profiler_schedule(
         reset_peak_memory_if_needed(device)
         start = time.perf_counter()
         _ = run_kv_cache_workload(
-            model=model,
+            prefill_forward=prefill_forward,
+            decode_forward=decode_forward,
             config=config,
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
@@ -401,7 +420,8 @@ def run_timed_steps_with_profiler_schedule(
 
 
 def run_torch_profile_config(
-    model: GPT,
+    prefill_forward: KVCacheForward,
+    decode_forward: KVCacheForward,
     config: GPTConfig,
     input_ids: torch.Tensor,
     batch_size: int,
@@ -435,7 +455,8 @@ def run_torch_profile_config(
         with_flops=True,
     ) as prof:
         active_timings, active_peak_memories = run_timed_steps_with_profiler_schedule(
-            model=model,
+            prefill_forward=prefill_forward,
+            decode_forward=decode_forward,
             config=config,
             input_ids=input_ids,
             max_new_tokens=max_new_tokens,
@@ -479,7 +500,8 @@ def run_torch_profile_config(
 
 
 def run_unprofiled_config(
-    model: GPT,
+    prefill_forward: KVCacheForward,
+    decode_forward: KVCacheForward,
     config: GPTConfig,
     input_ids: torch.Tensor,
     batch_size: int,
@@ -493,7 +515,8 @@ def run_unprofiled_config(
     seed: int,
 ) -> dict[str, float | int | str]:
     active_timings, active_peak_memories = run_timed_steps(
-        model=model,
+        prefill_forward=prefill_forward,
+        decode_forward=decode_forward,
         config=config,
         input_ids=input_ids,
         max_new_tokens=max_new_tokens,
@@ -622,7 +645,7 @@ def main() -> None:
 
     set_seed(args.seed)
     model = build_model(args.model_name, args.device)
-    kv_cache_model = compile_kv_cache_model(model)
+    prefill_forward, decode_forward = compile_kv_cache_forwards(model)
     rows = []
     is_sweep = len(prompt_lengths) > 1 or len(batch_sizes) > 1
 
@@ -657,7 +680,8 @@ def main() -> None:
             )
             if args.profile_tool == "torch":
                 row = run_torch_profile_config(
-                    model=kv_cache_model,
+                    prefill_forward=prefill_forward,
+                    decode_forward=decode_forward,
                     config=model.config,
                     input_ids=input_ids,
                     batch_size=batch_size,
@@ -674,7 +698,8 @@ def main() -> None:
                 )
             else:
                 row = run_unprofiled_config(
-                    model=kv_cache_model,
+                    prefill_forward=prefill_forward,
+                    decode_forward=decode_forward,
                     config=model.config,
                     input_ids=input_ids,
                     batch_size=batch_size,

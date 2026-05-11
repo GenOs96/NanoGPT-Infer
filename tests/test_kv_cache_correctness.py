@@ -39,6 +39,19 @@ def build_kv_cache(model: GPT, batch_size: int, max_seq_len: int) -> KVCache:
     )
 
 
+def compile_kv_cache_forwards(model: GPT):
+    def prefill(tokens: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
+        return model(tokens, kv_cache=kv_cache)
+
+    def decode(next_token: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
+        return model(next_token, kv_cache=kv_cache)
+
+    return (
+        torch.compile(prefill, mode="reduce-overhead"),
+        torch.compile(decode, mode="reduce-overhead"),
+    )
+
+
 class KVCacheCorrectnessTest(unittest.TestCase):
     def test_cached_logits_match_full_context_logits(self) -> None:
         model = build_tiny_model()
@@ -107,9 +120,8 @@ class KVCacheCorrectnessTest(unittest.TestCase):
         baseline_model = build_tiny_model()
         kv_cache_source_model = build_tiny_model()
         try:
-            compiled_kv_cache_model = torch.compile(
-                kv_cache_source_model,
-                mode="reduce-overhead",
+            prefill_forward, decode_forward = compile_kv_cache_forwards(
+                kv_cache_source_model
             )
         except Exception as exc:
             raise unittest.SkipTest(f"torch.compile is unavailable: {exc}") from exc
@@ -125,7 +137,7 @@ class KVCacheCorrectnessTest(unittest.TestCase):
         with torch.inference_mode():
             full_context = prompt
             baseline_logits = baseline_model(full_context)
-            cached_logits = compiled_kv_cache_model(full_context, kv_cache=kv_cache)
+            cached_logits = prefill_forward(full_context, kv_cache)
 
             torch.testing.assert_close(
                 cached_logits,
@@ -139,10 +151,7 @@ class KVCacheCorrectnessTest(unittest.TestCase):
                 full_context = torch.cat([full_context, next_token], dim=1)
 
                 baseline_logits = baseline_model(full_context)
-                cached_logits = compiled_kv_cache_model(
-                    next_token,
-                    kv_cache=kv_cache,
-                )
+                cached_logits = decode_forward(next_token, kv_cache)
 
                 torch.testing.assert_close(
                     cached_logits[:, -1, :],
