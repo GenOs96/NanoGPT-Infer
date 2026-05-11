@@ -199,6 +199,20 @@ def profiler_range(name: str, enable_nvtx: bool):
             yield
 
 
+@contextmanager
+def cuda_profiler_capture(device: str):
+    if device.startswith("cuda") and torch.cuda.is_available():
+        sync_if_needed(device)
+        torch.cuda.cudart().cudaProfilerStart()
+        try:
+            yield
+        finally:
+            sync_if_needed(device)
+            torch.cuda.cudart().cudaProfilerStop()
+    else:
+        yield
+
+
 def build_model(model_name: str, device: str) -> GPT:
     hf_model = GPT2LMHeadModel.from_pretrained(model_name)
     hf_model.eval()
@@ -310,6 +324,56 @@ def run_timed_steps(
     device: str,
     seed: int,
 ) -> tuple[list[float], list[float]]:
+    step_latencies = []
+    peak_memories = []
+
+    for step in range(warmup_steps):
+        set_seed(seed + step)
+        _ = run_kv_cache_workload(
+            model=model,
+            config=config,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            enable_nvtx=False,
+            mark_decode_steps=False,
+        )
+
+    with cuda_profiler_capture(device):
+        for step in range(active_steps):
+            step_seed = seed + warmup_steps + step
+            set_seed(step_seed)
+            sync_if_needed(device)
+            reset_peak_memory_if_needed(device)
+            start = time.perf_counter()
+            _ = run_kv_cache_workload(
+                model=model,
+                config=config,
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                enable_nvtx=enable_nvtx,
+                mark_decode_steps=mark_decode_steps,
+            )
+            sync_if_needed(device)
+            end = time.perf_counter()
+            step_latencies.append(end - start)
+            peak_memories.append(get_peak_memory_mb(device))
+
+    return step_latencies, peak_memories
+
+
+def run_timed_steps_with_profiler_schedule(
+    model: GPT,
+    config: GPTConfig,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    warmup_steps: int,
+    active_steps: int,
+    enable_nvtx: bool,
+    mark_decode_steps: bool,
+    device: str,
+    seed: int,
+    prof,
+) -> tuple[list[float], list[float]]:
     total_steps = warmup_steps + active_steps
     step_latencies = []
     peak_memories = []
@@ -329,6 +393,7 @@ def run_timed_steps(
         )
         sync_if_needed(device)
         end = time.perf_counter()
+        prof.step()
         step_latencies.append(end - start)
         peak_memories.append(get_peak_memory_mb(device))
 
@@ -359,9 +424,6 @@ def run_torch_profile_config(
         activities.append(ProfilerActivity.CUDA)
 
     run_name = f"kv_cache_b{batch_size}_s{prompt_length}_d{max_new_tokens}_{device.replace(':', '_')}"
-    total_steps = warmup_steps + active_steps
-    timed_steps = []
-    peak_memories = []
 
     with profile(
         activities=activities,
@@ -372,27 +434,19 @@ def run_torch_profile_config(
         with_stack=True,
         with_flops=True,
     ) as prof:
-        for step in range(total_steps):
-            set_seed(seed + step)
-            sync_if_needed(device)
-            reset_peak_memory_if_needed(device)
-            start = time.perf_counter()
-            _ = run_kv_cache_workload(
-                model=model,
-                config=config,
-                input_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                enable_nvtx=enable_nvtx,
-                mark_decode_steps=mark_decode_steps,
-            )
-            sync_if_needed(device)
-            end = time.perf_counter()
-            prof.step()
-            timed_steps.append(end - start)
-            peak_memories.append(get_peak_memory_mb(device))
-
-    active_timings = timed_steps[warmup_steps:]
-    active_peak_memories = peak_memories[warmup_steps:]
+        active_timings, active_peak_memories = run_timed_steps_with_profiler_schedule(
+            model=model,
+            config=config,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            warmup_steps=warmup_steps,
+            active_steps=active_steps,
+            enable_nvtx=enable_nvtx,
+            mark_decode_steps=mark_decode_steps,
+            device=device,
+            seed=seed,
+            prof=prof,
+        )
     latency_stats = summarize(active_timings)
     decode_ms = [
         latency * 1000.0 / max_new_tokens for latency in active_timings
@@ -522,6 +576,8 @@ def print_nsight_commands(args: argparse.Namespace) -> None:
     )
     nsys_cmd = (
         "nsys profile --trace=cuda,nvtx,osrt "
+        "--capture-range=cudaProfilerApi "
+        "--capture-range-end=stop "
         "--sample=none "
         f"--output experiments/artifacts/kv_cache_profiler/nsys_kv_cache_{shape_name} "
         + base_cmd
