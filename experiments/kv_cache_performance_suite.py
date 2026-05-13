@@ -169,6 +169,7 @@ def build_model(model_name: str, device: str) -> GPT:
 
 KVCacheModel = Callable[..., tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]]
 PastKV = list[tuple[torch.Tensor, torch.Tensor]] | None
+KVStorage = list[tuple[torch.Tensor, torch.Tensor]]
 
 
 def compile_kv_cache_model(model: GPT) -> KVCacheModel:
@@ -199,19 +200,44 @@ def summarize(values: list[float]) -> dict[str, float]:
     return {"mean": float(sum(values) / len(values))}
 
 
-def append_past_kv(
-    past_kv: PastKV,
-    kv_updates: list[tuple[torch.Tensor, torch.Tensor]],
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    if past_kv is None:
-        return [(k_update.clone(), v_update.clone()) for k_update, v_update in kv_updates]
+def build_kv_storage(model: GPT, batch_size: int, total_len: int, device: torch.device) -> KVStorage:
+    head_dim = model.config.n_embd // model.config.n_head
     return [
         (
-            torch.cat([past_k, k_update], dim=2),
-            torch.cat([past_v, v_update], dim=2),
+            torch.empty(
+                batch_size,
+                model.config.n_head,
+                total_len,
+                head_dim,
+                device=device,
+            ),
+            torch.empty(
+                batch_size,
+                model.config.n_head,
+                total_len,
+                head_dim,
+                device=device,
+            ),
         )
-        for (past_k, past_v), (k_update, v_update) in zip(past_kv, kv_updates)
+        for _ in range(model.config.n_layer)
     ]
+
+
+def get_past_kv(kv_storage: KVStorage, seq_len: int) -> PastKV:
+    if seq_len == 0:
+        return None
+    return [(k_cache[:, :, :seq_len, :], v_cache[:, :, :seq_len, :]) for k_cache, v_cache in kv_storage]
+
+
+def write_kv_updates(
+    kv_storage: KVStorage,
+    kv_updates: list[tuple[torch.Tensor, torch.Tensor]],
+    start_pos: int,
+) -> None:
+    for (k_cache, v_cache), (k_update, v_update) in zip(kv_storage, kv_updates):
+        end_pos = start_pos + k_update.size(2)
+        k_cache[:, :, start_pos:end_pos, :].copy_(k_update)
+        v_cache[:, :, start_pos:end_pos, :].copy_(v_update)
 
 
 @torch.inference_mode()
@@ -236,19 +262,25 @@ def generate_with_kv_cache(
     generated_tokens: int,
 ) -> torch.Tensor:
     tokens = input_ids.clone()
-    _, prompt_len = tokens.shape
-    past_kv: PastKV = None
+    batch_size, prompt_len = tokens.shape
+    kv_storage = build_kv_storage(
+        model,
+        batch_size,
+        prompt_len + generated_tokens,
+        tokens.device,
+    )
     start_pos = 0
-    logits, kv_updates = kv_cache_model(tokens, past_kv, start_pos)
-    past_kv = append_past_kv(past_kv, kv_updates)
+    logits, kv_updates = kv_cache_model(tokens, None, start_pos)
+    write_kv_updates(kv_storage, kv_updates, start_pos)
     start_pos += prompt_len
 
     for step in range(generated_tokens):
         next_token = sample_logits(logits)
         tokens = torch.cat([tokens, next_token], dim=1)
         if step < generated_tokens - 1:
+            past_kv = get_past_kv(kv_storage, start_pos)
             logits, kv_updates = kv_cache_model(next_token, past_kv, start_pos)
-            past_kv = append_past_kv(past_kv, kv_updates)
+            write_kv_updates(kv_storage, kv_updates, start_pos)
             start_pos += 1
 
     return tokens
@@ -355,11 +387,16 @@ def run_phase_once(
     sync_if_needed(device)
     prefill_start = time.perf_counter()
     if mode == "kv_cache":
-        _, prompt_len = tokens.shape
-        past_kv: PastKV = None
+        batch_size, prompt_len = tokens.shape
+        kv_storage = build_kv_storage(
+            model,
+            batch_size,
+            prompt_len + generated_tokens,
+            tokens.device,
+        )
         start_pos = 0
-        logits, kv_updates = kv_cache_model(tokens, past_kv, start_pos)
-        past_kv = append_past_kv(past_kv, kv_updates)
+        logits, kv_updates = kv_cache_model(tokens, None, start_pos)
+        write_kv_updates(kv_storage, kv_updates, start_pos)
         start_pos += prompt_len
     else:
         active_model = model
@@ -374,8 +411,9 @@ def run_phase_once(
         tokens = torch.cat([tokens, next_token], dim=1)
         if step < generated_tokens - 1:
             if mode == "kv_cache":
+                past_kv = get_past_kv(kv_storage, start_pos)
                 logits, kv_updates = kv_cache_model(next_token, past_kv, start_pos)
-                past_kv = append_past_kv(past_kv, kv_updates)
+                write_kv_updates(kv_storage, kv_updates, start_pos)
                 start_pos += 1
             else:
                 logits = active_model(tokens)

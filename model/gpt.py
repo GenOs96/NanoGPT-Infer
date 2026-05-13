@@ -79,6 +79,8 @@ class CausalSelfAttention(nn.Module):
             if past_k is not None and past_v is not None:
                 k = torch.cat([past_k, k], dim=2)
                 v = torch.cat([past_v, v], dim=2)
+                if q.size(2) == 1:
+                    is_decoding = True
 
             if kv_cache is not None:
                 with record_function("kv_cache"):
@@ -231,12 +233,14 @@ class GPT(nn.Module):
 
             present_kv = []
             key_len = start_pos + T
-            attn_mask = self.build_attention_mask(
-                query_start=start_pos,
-                query_len=T,
-                key_len=key_len,
-                device=idx.device,
-            )
+            attn_mask = None
+            if start_pos > 0 and T > 1:
+                attn_mask = self.build_attention_mask(
+                    query_start=start_pos,
+                    query_len=T,
+                    key_len=key_len,
+                    device=idx.device,
+                )
 
             for i, block in enumerate(self.blocks):
                 layer_past = past_kv[i]
