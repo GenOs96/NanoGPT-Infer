@@ -168,20 +168,11 @@ def build_model(model_name: str, device: str) -> GPT:
     return model
 
 
-KVCacheForward = Callable[[torch.Tensor, KVCache], torch.Tensor]
+KVCacheModel = Callable[..., torch.Tensor]
 
 
-def compile_kv_cache_forwards(model: GPT) -> tuple[KVCacheForward, KVCacheForward]:
-    def prefill(tokens: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
-        return model(tokens, kv_cache=kv_cache)
-
-    def decode(next_token: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
-        return model(next_token, kv_cache=kv_cache)
-
-    return (
-        torch.compile(prefill, mode="reduce-overhead"),
-        torch.compile(decode, mode="reduce-overhead"),
-    )
+def compile_kv_cache_model(model: GPT) -> KVCacheModel:
+    return torch.compile(model, mode="reduce-overhead")
 
 
 def make_input_ids(
@@ -236,8 +227,7 @@ def generate_no_cache(
 @torch.inference_mode()
 def generate_with_kv_cache(
     model: GPT,
-    prefill_forward: KVCacheForward,
-    decode_forward: KVCacheForward,
+    kv_cache_model: KVCacheModel,
     input_ids: torch.Tensor,
     generated_tokens: int,
 ) -> torch.Tensor:
@@ -245,21 +235,20 @@ def generate_with_kv_cache(
     batch_size, prompt_len = tokens.shape
     total_len = prompt_len + generated_tokens
     kv_cache = build_kv_cache(model, batch_size, total_len, str(tokens.device))
-    logits = prefill_forward(tokens, kv_cache)
+    logits = kv_cache_model(tokens, kv_cache=kv_cache)
 
     for step in range(generated_tokens):
         next_token = sample_logits(logits)
         tokens = torch.cat([tokens, next_token], dim=1)
         if step < generated_tokens - 1:
-            logits = decode_forward(next_token, kv_cache)
+            logits = kv_cache_model(next_token, kv_cache=kv_cache)
 
     return tokens
 
 
 def run_e2e_once(
     model: GPT,
-    prefill_forward: KVCacheForward,
-    decode_forward: KVCacheForward,
+    kv_cache_model: KVCacheModel,
     input_ids: torch.Tensor,
     generated_tokens: int,
     mode: str,
@@ -269,8 +258,7 @@ def run_e2e_once(
     if mode == "kv_cache":
         return generate_with_kv_cache(
             model,
-            prefill_forward,
-            decode_forward,
+            kv_cache_model,
             input_ids,
             generated_tokens,
         )
@@ -280,8 +268,7 @@ def run_e2e_once(
 def benchmark_e2e_config(
     test_name: str,
     model: GPT,
-    prefill_forward: KVCacheForward,
-    decode_forward: KVCacheForward,
+    kv_cache_model: KVCacheModel,
     input_ids: torch.Tensor,
     generated_tokens: int,
     mode: str,
@@ -297,8 +284,7 @@ def benchmark_e2e_config(
         set_seed(seed + run_idx)
         _ = run_e2e_once(
             model,
-            prefill_forward,
-            decode_forward,
+            kv_cache_model,
             input_ids,
             generated_tokens,
             mode,
@@ -313,8 +299,7 @@ def benchmark_e2e_config(
         start = time.perf_counter()
         _ = run_e2e_once(
             model,
-            prefill_forward,
-            decode_forward,
+            kv_cache_model,
             input_ids,
             generated_tokens,
             mode,
@@ -351,8 +336,7 @@ def benchmark_e2e_config(
 @torch.inference_mode()
 def run_phase_once(
     model: GPT,
-    prefill_forward: KVCacheForward,
-    decode_forward: KVCacheForward,
+    kv_cache_model: KVCacheModel,
     input_ids: torch.Tensor,
     generated_tokens: int,
     mode: str,
@@ -370,7 +354,7 @@ def run_phase_once(
             prompt_len + generated_tokens,
             str(tokens.device),
         )
-        logits = prefill_forward(tokens, kv_cache)
+        logits = kv_cache_model(tokens, kv_cache=kv_cache)
     else:
         active_model = model
         kv_cache = None
@@ -385,7 +369,7 @@ def run_phase_once(
         tokens = torch.cat([tokens, next_token], dim=1)
         if step < generated_tokens - 1:
             if mode == "kv_cache":
-                logits = decode_forward(next_token, kv_cache)
+                logits = kv_cache_model(next_token, kv_cache=kv_cache)
             else:
                 logits = active_model(tokens)
     sync_if_needed(device)
@@ -396,8 +380,7 @@ def run_phase_once(
 
 def benchmark_phase_config(
     model: GPT,
-    prefill_forward: KVCacheForward,
-    decode_forward: KVCacheForward,
+    kv_cache_model: KVCacheModel,
     input_ids: torch.Tensor,
     generated_tokens: int,
     mode: str,
@@ -413,8 +396,7 @@ def benchmark_phase_config(
         set_seed(seed + run_idx)
         _ = run_phase_once(
             model,
-            prefill_forward,
-            decode_forward,
+            kv_cache_model,
             input_ids,
             generated_tokens,
             mode,
@@ -429,8 +411,7 @@ def benchmark_phase_config(
         reset_peak_memory_if_needed(device)
         prefill_latency, decode_latency = run_phase_once(
             model,
-            prefill_forward,
-            decode_forward,
+            kv_cache_model,
             input_ids,
             generated_tokens,
             mode,
@@ -481,8 +462,7 @@ def run_e2e_suite(
     test_name: str,
     configs: list[tuple[int, int, int]],
     model: GPT,
-    prefill_forward: KVCacheForward,
-    decode_forward: KVCacheForward,
+    kv_cache_model: KVCacheModel,
     vocab_size: int,
     args: argparse.Namespace,
 ) -> list[dict[str, float | int | str]]:
@@ -505,8 +485,7 @@ def run_e2e_suite(
                 benchmark_e2e_config(
                     test_name=test_name,
                     model=model,
-                    prefill_forward=prefill_forward,
-                    decode_forward=decode_forward,
+                    kv_cache_model=kv_cache_model,
                     input_ids=input_ids,
                     generated_tokens=generated_tokens,
                     mode=mode,
@@ -521,8 +500,7 @@ def run_e2e_suite(
 
 def run_phase_suite(
     model: GPT,
-    prefill_forward: KVCacheForward,
-    decode_forward: KVCacheForward,
+    kv_cache_model: KVCacheModel,
     vocab_size: int,
     args: argparse.Namespace,
 ) -> list[dict[str, float | int | str]]:
@@ -544,8 +522,7 @@ def run_phase_suite(
             rows.extend(
                 benchmark_phase_config(
                     model=model,
-                    prefill_forward=prefill_forward,
-                    decode_forward=decode_forward,
+                    kv_cache_model=kv_cache_model,
                     input_ids=input_ids,
                     generated_tokens=generated_tokens,
                     mode=mode,
@@ -772,7 +749,7 @@ def main() -> None:
 
     set_seed(args.seed)
     model = build_model(args.model_name, args.device)
-    prefill_forward, decode_forward = compile_kv_cache_forwards(model)
+    kv_cache_model = compile_kv_cache_model(model)
     if args.max_context_len > model.config.block_size:
         raise ValueError(
             f"max_context_len={args.max_context_len} exceeds "
@@ -785,8 +762,7 @@ def main() -> None:
             "fixed_prompt_vary_decode",
             [(prompt, gen, 1) for prompt, gen in FIXED_PROMPT_VARY_DECODE],
             model,
-            prefill_forward,
-            decode_forward,
+            kv_cache_model,
             model.config.vocab_size,
             args,
         )
@@ -796,8 +772,7 @@ def main() -> None:
             "fixed_decode_vary_prompt",
             [(prompt, gen, 1) for prompt, gen in FIXED_DECODE_VARY_PROMPT],
             model,
-            prefill_forward,
-            decode_forward,
+            kv_cache_model,
             model.config.vocab_size,
             args,
         )
@@ -806,8 +781,7 @@ def main() -> None:
         rows.extend(
             run_phase_suite(
                 model,
-                prefill_forward,
-                decode_forward,
+                kv_cache_model,
                 model.config.vocab_size,
                 args,
             )
@@ -818,8 +792,7 @@ def main() -> None:
                 "batch_sweep",
                 BATCH_SWEEP,
                 model,
-                prefill_forward,
-                decode_forward,
+                kv_cache_model,
                 model.config.vocab_size,
                 args,
             )
