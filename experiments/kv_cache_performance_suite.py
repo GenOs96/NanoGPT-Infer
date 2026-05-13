@@ -204,7 +204,7 @@ def append_past_kv(
     kv_updates: list[tuple[torch.Tensor, torch.Tensor]],
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
     if past_kv is None:
-        return kv_updates
+        return [(k_update.clone(), v_update.clone()) for k_update, v_update in kv_updates]
     return [
         (
             torch.cat([past_k, k_update], dim=2),
