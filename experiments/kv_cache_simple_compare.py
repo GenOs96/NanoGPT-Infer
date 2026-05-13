@@ -13,7 +13,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from inference.kv_cache import KVCache
 from model.gpt import GPT, GPTConfig, load_hf_weights
 
 
@@ -21,7 +20,8 @@ DEFAULT_MODEL_NAME = "gpt2"
 DEFAULT_DTYPE = torch.float32
 DEFAULT_SEED = 1234
 
-KVCacheModel = Callable[..., torch.Tensor]
+KVCacheModel = Callable[..., tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]]
+PastKV = list[tuple[torch.Tensor, torch.Tensor]] | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,19 +101,23 @@ def make_input_ids(
     )
 
 
-def build_kv_cache(model: GPT, batch_size: int, total_len: int, device: str) -> KVCache:
-    return KVCache(
-        n_layer=model.config.n_layer,
-        batch_size=batch_size,
-        n_head=model.config.n_head,
-        max_seq_len=total_len,
-        head_dim=model.config.n_embd // model.config.n_head,
-        device=device,
-    )
-
-
 def next_token_from_logits(logits: torch.Tensor) -> torch.Tensor:
     return torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+
+
+def append_past_kv(
+    past_kv: PastKV,
+    kv_updates: list[tuple[torch.Tensor, torch.Tensor]],
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    if past_kv is None:
+        return kv_updates
+    return [
+        (
+            torch.cat([past_k, k_update], dim=2),
+            torch.cat([past_v, v_update], dim=2),
+        )
+        for (past_k, past_v), (k_update, v_update) in zip(past_kv, kv_updates)
+    ]
 
 
 @torch.inference_mode()
@@ -138,20 +142,20 @@ def generate_optimized(
     new_tokens: int,
 ) -> torch.Tensor:
     tokens = input_ids.clone()
-    batch_size, prompt_len = tokens.shape
-    kv_cache = build_kv_cache(
-        model,
-        batch_size,
-        prompt_len + new_tokens,
-        str(tokens.device),
-    )
+    _, prompt_len = tokens.shape
+    past_kv: PastKV = None
+    start_pos = 0
 
-    logits = kv_cache_model(tokens, kv_cache=kv_cache)
+    logits, kv_updates = kv_cache_model(tokens, past_kv, start_pos)
+    past_kv = append_past_kv(past_kv, kv_updates)
+    start_pos += prompt_len
     for step in range(new_tokens):
         next_token = next_token_from_logits(logits)
         tokens = torch.cat([tokens, next_token], dim=1)
         if step < new_tokens - 1:
-            logits = kv_cache_model(next_token, kv_cache=kv_cache)
+            logits, kv_updates = kv_cache_model(next_token, past_kv, start_pos)
+            past_kv = append_past_kv(past_kv, kv_updates)
+            start_pos += 1
     return tokens
 
 
@@ -221,7 +225,9 @@ def main() -> None:
         args.seed,
     )
     kv_cache_model = (
-        torch.compile(model, mode=args.compile_mode) if args.compile else model
+        torch.compile(model.forward_with_past, mode=args.compile_mode)
+        if args.compile
+        else model.forward_with_past
     )
 
     print(

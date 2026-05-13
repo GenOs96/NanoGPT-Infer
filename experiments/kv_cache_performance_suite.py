@@ -16,7 +16,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from inference.kv_cache import KVCache
 from inference.sampler import sample_logits
 from model.gpt import GPT, GPTConfig, load_hf_weights
 
@@ -168,11 +167,12 @@ def build_model(model_name: str, device: str) -> GPT:
     return model
 
 
-KVCacheModel = Callable[..., torch.Tensor]
+KVCacheModel = Callable[..., tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]]
+PastKV = list[tuple[torch.Tensor, torch.Tensor]] | None
 
 
 def compile_kv_cache_model(model: GPT) -> KVCacheModel:
-    return torch.compile(model, mode="reduce-overhead")
+    return torch.compile(model.forward_with_past, mode="reduce-overhead")
 
 
 def make_input_ids(
@@ -193,21 +193,25 @@ def make_input_ids(
     )
 
 
-def build_kv_cache(model: GPT, batch_size: int, total_len: int, device: str) -> KVCache:
-    return KVCache(
-        n_layer=model.config.n_layer,
-        batch_size=batch_size,
-        n_head=model.config.n_head,
-        max_seq_len=total_len,
-        head_dim=model.config.n_embd // model.config.n_head,
-        device=device,
-    )
-
-
 def summarize(values: list[float]) -> dict[str, float]:
     if not values:
         return {"mean": 0.0}
     return {"mean": float(sum(values) / len(values))}
+
+
+def append_past_kv(
+    past_kv: PastKV,
+    kv_updates: list[tuple[torch.Tensor, torch.Tensor]],
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    if past_kv is None:
+        return kv_updates
+    return [
+        (
+            torch.cat([past_k, k_update], dim=2),
+            torch.cat([past_v, v_update], dim=2),
+        )
+        for (past_k, past_v), (k_update, v_update) in zip(past_kv, kv_updates)
+    ]
 
 
 @torch.inference_mode()
@@ -232,16 +236,20 @@ def generate_with_kv_cache(
     generated_tokens: int,
 ) -> torch.Tensor:
     tokens = input_ids.clone()
-    batch_size, prompt_len = tokens.shape
-    total_len = prompt_len + generated_tokens
-    kv_cache = build_kv_cache(model, batch_size, total_len, str(tokens.device))
-    logits = kv_cache_model(tokens, kv_cache=kv_cache)
+    _, prompt_len = tokens.shape
+    past_kv: PastKV = None
+    start_pos = 0
+    logits, kv_updates = kv_cache_model(tokens, past_kv, start_pos)
+    past_kv = append_past_kv(past_kv, kv_updates)
+    start_pos += prompt_len
 
     for step in range(generated_tokens):
         next_token = sample_logits(logits)
         tokens = torch.cat([tokens, next_token], dim=1)
         if step < generated_tokens - 1:
-            logits = kv_cache_model(next_token, kv_cache=kv_cache)
+            logits, kv_updates = kv_cache_model(next_token, past_kv, start_pos)
+            past_kv = append_past_kv(past_kv, kv_updates)
+            start_pos += 1
 
     return tokens
 
@@ -347,17 +355,14 @@ def run_phase_once(
     sync_if_needed(device)
     prefill_start = time.perf_counter()
     if mode == "kv_cache":
-        batch_size, prompt_len = tokens.shape
-        kv_cache = build_kv_cache(
-            model,
-            batch_size,
-            prompt_len + generated_tokens,
-            str(tokens.device),
-        )
-        logits = kv_cache_model(tokens, kv_cache=kv_cache)
+        _, prompt_len = tokens.shape
+        past_kv: PastKV = None
+        start_pos = 0
+        logits, kv_updates = kv_cache_model(tokens, past_kv, start_pos)
+        past_kv = append_past_kv(past_kv, kv_updates)
+        start_pos += prompt_len
     else:
         active_model = model
-        kv_cache = None
         logits = active_model(tokens)
     sync_if_needed(device)
     prefill_end = time.perf_counter()
@@ -369,7 +374,9 @@ def run_phase_once(
         tokens = torch.cat([tokens, next_token], dim=1)
         if step < generated_tokens - 1:
             if mode == "kv_cache":
-                logits = kv_cache_model(next_token, kv_cache=kv_cache)
+                logits, kv_updates = kv_cache_model(next_token, past_kv, start_pos)
+                past_kv = append_past_kv(past_kv, kv_updates)
+                start_pos += 1
             else:
                 logits = active_model(tokens)
     sync_if_needed(device)

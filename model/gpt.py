@@ -44,7 +44,16 @@ class CausalSelfAttention(nn.Module):
             .view(1, 1, config.block_size, config.block_size),
         )
 
-    def forward(self, x, kv_cache=None, layer_idx=None):
+    def forward(
+        self,
+        x,
+        kv_cache=None,
+        layer_idx=None,
+        past_k=None,
+        past_v=None,
+        attn_mask=None,
+        return_kv_update=False,
+    ):
         B, T, C = x.shape
 
         attn_scope = (
@@ -64,6 +73,13 @@ class CausalSelfAttention(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
 
+            k_update = k
+            v_update = v
+
+            if past_k is not None and past_v is not None:
+                k = torch.cat([past_k, k], dim=2)
+                v = torch.cat([past_v, v], dim=2)
+
             if kv_cache is not None:
                 with record_function("kv_cache"):
                     k, v = kv_cache.update(layer_idx, k, v)
@@ -72,14 +88,17 @@ class CausalSelfAttention(nn.Module):
             
             y = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=0.0,
-                is_causal=not is_decoding
+                is_causal=attn_mask is None and not is_decoding
             )
 
             y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-            return self.proj(y)
+            y = self.proj(y)
+            if return_kv_update:
+                return y, (k_update, v_update)
+            return y
 
 
 # -----------------------------------------------------------
@@ -119,6 +138,28 @@ class Block(nn.Module):
             )
             x = x + self.mlp(self.ln2(x), layer_idx=layer_idx)
             return x
+
+    def forward_with_past(
+        self,
+        x,
+        past_k=None,
+        past_v=None,
+        attn_mask=None,
+        layer_idx=None,
+    ):
+        block_scope = f"block_{layer_idx}" if layer_idx is not None else "block"
+        with record_function(block_scope):
+            attn_out, kv_update = self.attn(
+                self.ln1(x),
+                layer_idx=layer_idx,
+                past_k=past_k,
+                past_v=past_v,
+                attn_mask=attn_mask,
+                return_kv_update=True,
+            )
+            x = x + attn_out
+            x = x + self.mlp(self.ln2(x), layer_idx=layer_idx)
+            return x, kv_update
 
 
 # -----------------------------------------------------------
@@ -164,6 +205,55 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
 
             return logits
+
+    def build_attention_mask(self, query_start, query_len, key_len, device):
+        query_positions = torch.arange(
+            query_start,
+            query_start + query_len,
+            device=device,
+        ).unsqueeze(1)
+        key_positions = torch.arange(key_len, device=device).unsqueeze(0)
+        return (key_positions <= query_positions).view(1, 1, query_len, key_len)
+
+    def forward_with_past(self, idx, past_kv=None, start_pos=0):
+        _, T = idx.shape
+
+        with record_function("gpt.forward"):
+            positions = torch.arange(
+                start_pos,
+                start_pos + T,
+                device=idx.device,
+            ).unsqueeze(0)
+            x = self.token_emb(idx) + self.pos_emb(positions)
+
+            if past_kv is None:
+                past_kv = [None for _ in range(len(self.blocks))]
+
+            present_kv = []
+            key_len = start_pos + T
+            attn_mask = self.build_attention_mask(
+                query_start=start_pos,
+                query_len=T,
+                key_len=key_len,
+                device=idx.device,
+            )
+
+            for i, block in enumerate(self.blocks):
+                layer_past = past_kv[i]
+                past_k = layer_past[0] if layer_past is not None else None
+                past_v = layer_past[1] if layer_past is not None else None
+                x, kv_update = block.forward_with_past(
+                    x,
+                    past_k=past_k,
+                    past_v=past_v,
+                    attn_mask=attn_mask,
+                    layer_idx=i,
+                )
+                present_kv.append(kv_update)
+
+            x = self.ln_f(x)
+            logits = self.lm_head(x)
+            return logits, present_kv
 
 # -----------------------------------------------------------
 # Weight Loading (Hugging Face GPT-2)
