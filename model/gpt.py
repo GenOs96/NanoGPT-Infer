@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.profiler import record_function
 
+from model.kv_attention import decode_attention_direct
+
 
 # -----------------------------------------------------------
 # Config
@@ -77,10 +79,11 @@ class CausalSelfAttention(nn.Module):
             v_update = v
 
             if past_k is not None and past_v is not None:
-                k = torch.cat([past_k, k], dim=2)
-                v = torch.cat([past_v, v], dim=2)
                 if q.size(2) == 1:
                     is_decoding = True
+                else:
+                    k = torch.cat([past_k, k], dim=2)
+                    v = torch.cat([past_v, v], dim=2)
 
             if kv_cache is not None:
                 with record_function("kv_cache"):
@@ -88,12 +91,15 @@ class CausalSelfAttention(nn.Module):
                 if q.size(2) == 1:
                     is_decoding = True
             
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=0.0,
-                is_causal=attn_mask is None and not is_decoding
-            )
+            if past_k is not None and past_v is not None and is_decoding:
+                y = decode_attention_direct(q, past_k, past_v, k_update, v_update)
+            else:
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=attn_mask is None and not is_decoding
+                )
 
             y = y.transpose(1, 2).contiguous().view(B, T, C)
 
