@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 import random
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ DEFAULT_MODEL_NAME = "gpt2"
 DEFAULT_MAX_CONTEXT_LEN = 1024
 DEFAULT_WARMUP_RUNS = 2
 DEFAULT_MEASURE_RUNS = 3
+DEFAULT_BATCH_MEASURE_RUNS = 7
 DEFAULT_SEED = 1234
 DEFAULT_DTYPE = torch.float32
 
@@ -80,6 +82,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MEASURE_RUNS,
         help="Measured runs per configuration.",
+    )
+    parser.add_argument(
+        "--batch-measure-runs",
+        type=int,
+        default=DEFAULT_BATCH_MEASURE_RUNS,
+        help=(
+            "Measured runs for the batch-size sweep. This defaults higher "
+            "because small batch shapes are noisy."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -196,8 +207,11 @@ def make_input_ids(
 
 def summarize(values: list[float]) -> dict[str, float]:
     if not values:
-        return {"mean": 0.0}
-    return {"mean": float(sum(values) / len(values))}
+        return {"mean": 0.0, "median": 0.0}
+    return {
+        "mean": float(sum(values) / len(values)),
+        "median": float(statistics.median(values)),
+    }
 
 
 def build_kv_storage(model: GPT, batch_size: int, total_len: int, device: torch.device) -> KVStorage:
@@ -329,6 +343,7 @@ def benchmark_e2e_config(
             generated_tokens,
             mode,
         )
+    sync_if_needed(device)
 
     timings = []
     peak_memories = []
@@ -367,9 +382,13 @@ def benchmark_e2e_config(
         "batch_size": batch_size,
         "measure_runs": measure_runs,
         "latency_s_mean": latency_stats["mean"],
+        "latency_s_median": latency_stats["median"],
         "ms_per_token_mean": summarize(ms_per_token)["mean"],
+        "ms_per_token_median": summarize(ms_per_token)["median"],
         "throughput_tok_s_mean": summarize(throughput)["mean"],
+        "throughput_tok_s_median": summarize(throughput)["median"],
         "peak_gpu_memory_mb_mean": summarize(peak_memories)["mean"],
+        "peak_gpu_memory_mb_median": summarize(peak_memories)["median"],
     }
 
 
@@ -447,6 +466,7 @@ def benchmark_phase_config(
             mode,
             device,
         )
+    sync_if_needed(device)
 
     prefill_timings = []
     decode_timings = []
@@ -490,15 +510,21 @@ def benchmark_phase_config(
             **common,
             "phase": "prefill",
             "latency_s_mean": prefill_stats["mean"],
+            "latency_s_median": prefill_stats["median"],
             "ms_per_token_mean": prefill_stats["mean"] * 1000.0 / prompt_len,
+            "ms_per_token_median": prefill_stats["median"] * 1000.0 / prompt_len,
             "throughput_tok_s_mean": batch_size * prompt_len / prefill_stats["mean"],
+            "throughput_tok_s_median": batch_size * prompt_len / prefill_stats["median"],
         },
         {
             **common,
             "phase": "decode",
             "latency_s_mean": decode_stats["mean"],
+            "latency_s_median": decode_stats["median"],
             "ms_per_token_mean": summarize(decode_ms_per_token)["mean"],
+            "ms_per_token_median": summarize(decode_ms_per_token)["median"],
             "throughput_tok_s_mean": summarize(decode_throughput)["mean"],
+            "throughput_tok_s_median": summarize(decode_throughput)["median"],
         },
     ]
 
@@ -535,7 +561,11 @@ def run_e2e_suite(
                     generated_tokens=generated_tokens,
                     mode=mode,
                     warmup_runs=args.warmup_runs,
-                    measure_runs=args.measure_runs,
+                    measure_runs=(
+                        args.batch_measure_runs
+                        if test_name == "batch_sweep"
+                        else args.measure_runs
+                    ),
                     device=args.device,
                     seed=args.seed + prompt_len * 10 + generated_tokens + batch_size,
                 )
@@ -592,9 +622,13 @@ def save_csv(rows: list[dict[str, float | int | str]], artifacts_dir: Path) -> P
         "batch_size",
         "measure_runs",
         "latency_s_mean",
+        "latency_s_median",
         "ms_per_token_mean",
+        "ms_per_token_median",
         "throughput_tok_s_mean",
+        "throughput_tok_s_median",
         "peak_gpu_memory_mb_mean",
+        "peak_gpu_memory_mb_median",
     ]
     fieldnames = sorted({field for row in rows for field in row.keys()})
     ordered = [field for field in preferred if field in fieldnames]
@@ -763,8 +797,8 @@ def plot_results(rows: list[dict[str, float | int | str]], artifacts_dir: Path) 
         axes[2, 1],
         batch_rows,
         "batch_size",
-        "throughput_tok_s_mean",
-        "Batch Sweep: Throughput",
+        "throughput_tok_s_median",
+        "Batch Sweep: Throughput (median)",
         "Batch size",
         "tokens/sec",
     )
@@ -786,11 +820,14 @@ def main() -> None:
         raise ValueError("--warmup-runs must be non-negative")
     if args.measure_runs <= 0:
         raise ValueError("--measure-runs must be positive")
+    if args.batch_measure_runs <= 0:
+        raise ValueError("--batch-measure-runs must be positive")
 
     artifacts_dir = get_artifacts_dir()
     print(f"Device: {args.device}")
     print(f"Artifacts dir: {artifacts_dir}")
     print(f"Warmup runs: {args.warmup_runs}, measure runs: {args.measure_runs}")
+    print(f"Batch measure runs: {args.batch_measure_runs}")
 
     set_seed(args.seed)
     model = build_model(args.model_name, args.device)
